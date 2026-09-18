@@ -7,6 +7,7 @@ use formal_utils::{
 };
 
 use formal::convert::NamedFsm;
+use formal::word::design_to_transition_sys;
 use parser_verilator::{
     ast::{Design, Domain},
     document::AstDocument,
@@ -26,7 +27,8 @@ struct Args {
     #[arg(long)]
     reset: Option<Domain>,
 
-    /// Write AIGER 1.9; .aag selects ASCII and .aig selects binary.
+    /// Write AIGER 1.9 or BTOR 2; .aag selects ASCII and .aig selects binary.
+    /// .btor/.btor2 selects btor.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -53,6 +55,24 @@ struct Args {
     /// Print every AIGER symbol that would normally be written.
     #[arg(long)]
     debug: bool,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum OutputFormat {
+    AigerAscii,
+    AigerBinary,
+    Btor,
+}
+
+impl OutputFormat {
+    fn from_ext(ext: Option<&str>) -> Option<Self> {
+        match ext {
+            Some("aag") => Some(Self::AigerAscii),
+            Some("aig") => Some(Self::AigerBinary),
+            Some("btor") | Some("btor2") => Some(Self::Btor),
+            _ => None,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -93,78 +113,99 @@ fn main() -> ExitCode {
     let Some(output) = args.output else {
         return ExitCode::SUCCESS;
     };
-
-    let mut model = match NamedFsm::from_design(&design, args.clock, args.reset) {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    println!("converted: {}", args.tree_json.display());
-    println!(
-        "clock: {:?} edge of {}",
-        model.clock.domain.edge, model.clock.domain.name
-    );
-    println!(
-        "inputs: {} signals, {} bits",
-        model.inputs.len(),
-        model.fsm.get_inputs().len()
-    );
-    println!(
-        "registers: {} signals, {} bits",
-        model.registers.len(),
-        model.fsm.get_latches().len()
-    );
-    println!(
-        "outputs: {} signals, {} bits",
-        model.outputs.len(),
-        model.fsm.get_outputs().len()
-    );
-    println!("gates: {}", model.fsm.get_gates().len());
-    println!(
-        "properties: {} assertions, {} assumptions, {} covers",
-        model.assertions.len(),
-        model.assumptions.len(),
-        model.covers.len()
-    );
-
-    if let Err(error) = select_property(&mut model.fsm, args.assert, args.cover) {
-        eprintln!("error: {error}");
-        return ExitCode::FAILURE;
-    }
-    if args.debug {
-        print_aiger_symbols(&model.fsm);
-    }
-    if args.zero_init {
-        model.initialize_registers_to_zero();
-    }
-    model.fsm.normalize_outputs();
-    model.fsm.reorder_gates();
-    model.fsm.verify(VerifyOrdering::Verify);
-    if args.strip_symbols {
-        clear_symbols(&mut model.fsm);
-    }
-
     let extension = output
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
-    let contents = match extension.as_deref() {
-        Some("aag") => write_aiger_ascii(&model.fsm, AigerVersion::V1_9),
-        Some("aig") => write_aiger_binary(&model.fsm, AigerVersion::V1_9),
-        _ => {
-            eprintln!(
-                "error: output {} must have a .aag or .aig extension",
-                output.display()
-            );
+    let Some(output_format) = OutputFormat::from_ext(extension.as_deref()) else {
+        eprintln!(
+            "error: output {} must have a .aag or .aig extension",
+            output.display()
+        );
+        return ExitCode::FAILURE;
+    };
+
+    if output_format == OutputFormat::Btor {
+        let sys = match design_to_transition_sys(
+            &design,
+            args.clock,
+            args.reset,
+            args.assert,
+            args.cover,
+        ) {
+            Ok(sys) => sys,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        if args.zero_init {
+            todo!("add zero init support for btor")
+        }
+    } else {
+        let mut model = match NamedFsm::from_design(&design, args.clock, args.reset) {
+            Ok(model) => model,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        println!("converted: {}", args.tree_json.display());
+        println!(
+            "clock: {:?} edge of {}",
+            model.clock.domain.edge, model.clock.domain.name
+        );
+        println!(
+            "inputs: {} signals, {} bits",
+            model.inputs.len(),
+            model.fsm.get_inputs().len()
+        );
+        println!(
+            "registers: {} signals, {} bits",
+            model.registers.len(),
+            model.fsm.get_latches().len()
+        );
+        println!(
+            "outputs: {} signals, {} bits",
+            model.outputs.len(),
+            model.fsm.get_outputs().len()
+        );
+        println!("gates: {}", model.fsm.get_gates().len());
+        println!(
+            "properties: {} assertions, {} assumptions, {} covers",
+            model.assertions.len(),
+            model.assumptions.len(),
+            model.covers.len()
+        );
+
+        if let Err(error) = select_property(&mut model.fsm, args.assert, args.cover) {
+            eprintln!("error: {error}");
             return ExitCode::FAILURE;
         }
-    };
-    if let Err(error) = fs::write(&output, contents) {
-        eprintln!("error: could not write {}: {error}", output.display());
-        return ExitCode::FAILURE;
+        if args.debug {
+            print_aiger_symbols(&model.fsm);
+        }
+        if args.zero_init {
+            model.initialize_registers_to_zero();
+        }
+        model.fsm.normalize_outputs();
+        model.fsm.reorder_gates();
+        model.fsm.verify(VerifyOrdering::Verify);
+        if args.strip_symbols {
+            clear_symbols(&mut model.fsm);
+        }
+
+        let contents = match output_format {
+            OutputFormat::AigerAscii => write_aiger_ascii(&model.fsm, AigerVersion::V1_9),
+            OutputFormat::AigerBinary => write_aiger_binary(&model.fsm, AigerVersion::V1_9),
+            OutputFormat::Btor => unreachable!(),
+        };
+        if let Err(error) = fs::write(&output, contents) {
+            eprintln!("error: could not write {}: {error}", output.display());
+            return ExitCode::FAILURE;
+        }
     }
     println!("wrote: {}", output.display());
 

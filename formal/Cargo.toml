@@ -9,6 +9,7 @@ clap = { version = "4.5", features = ["derive"] }
 ron = "0.12"
 formal-utils = { path = "../formal-utils" }
 parser-verilator = { path = "../parser-verilator" }
+patronus = "0.38.1"
 
 [lints]
 workspace = true

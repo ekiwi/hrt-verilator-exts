@@ -128,7 +128,7 @@ impl TryFrom<&AstDocument> for NamedFsm {
     }
 }
 
-fn select_domains(
+pub(crate) fn select_domains(
     design: &Design,
     clock: Option<&Domain>,
     reset: Option<&Domain>,
