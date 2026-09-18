@@ -8,9 +8,8 @@ use parser_verilator::{
     },
     document::AstDocument,
 };
-use patronus::expr::ExprRef;
+use patronus::expr::{Context, ExprRef, SerializableIrNode, WidthInt};
 use patronus::system::TransitionSystem;
-use std::task::Context;
 use std::{
     collections::{BTreeMap, BTreeSet},
     mem,
@@ -55,7 +54,7 @@ impl NamedFsm {
     }
 }
 
-type Environment = BTreeMap<VariableId, Vec<ExprRef>>;
+type Environment = BTreeMap<VariableId, ExprRef>;
 type PropertyGroups = (Vec<NamedProperty>, Vec<NamedProperty>, Vec<NamedProperty>);
 
 struct Converter<'a> {
@@ -66,24 +65,9 @@ struct Converter<'a> {
     pending: Environment,
 }
 
-impl TryFrom<&Design> for NamedFsm {
-    type Error = ConvertError;
-
-    fn try_from(design: &Design) -> Result<Self, Self::Error> {
-        let (clock, reset) = select_domains(design, None, None)?;
-        Converter {
-            design,
-            clock,
-            reset,
-            sys: TransitionSystem::new("todo".into()),
-            pending: Environment::new(),
-        }
-        .convert()
-    }
-}
-
 impl NamedFsm {
     pub fn from_design(
+        ctx: &mut Context,
         design: &Design,
         clock: Domain,
         reset: Option<Domain>,
@@ -96,25 +80,17 @@ impl NamedFsm {
             sys: TransitionSystem::new("todo".into()),
             pending: Environment::new(),
         }
-        .convert()
+        .convert(ctx)
     }
 
     pub fn from_document(
+        ctx: &mut Context,
         document: &AstDocument,
         clock: Domain,
         reset: Option<Domain>,
     ) -> Result<Self, ConvertError> {
         let design = Design::try_from(document)?;
-        Self::from_design(&design, clock, reset)
-    }
-}
-
-impl TryFrom<&AstDocument> for NamedFsm {
-    type Error = ConvertError;
-
-    fn try_from(document: &AstDocument) -> Result<Self, Self::Error> {
-        let design = Design::try_from(document)?;
-        Self::try_from(&design)
+        Self::from_design(ctx, &design, clock, reset)
     }
 }
 
@@ -241,90 +217,108 @@ fn label_variables_as(sys: &mut TransitionSystem, signal: &NamedSignal, name: &s
 }
 
 impl Converter<'_> {
-    fn convert(mut self) -> Result<NamedFsm, ConvertError> {
-        todo!()
+    fn analyse_rw(&self) -> (BTreeSet<VariableId>, BTreeSet<VariableId>) {
+        let all_statements = (&self.design.combinational)
+            .into_iter()
+            .chain(&self.design.sequential)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reads = BTreeSet::new();
+        let mut writes = BTreeSet::new();
+        all_statements
+            .as_slice()
+            .collect_accesses(&mut reads, &mut writes);
 
-        // if let Some(initial) = (&self.design.initial)
-        //     .into_iter()
-        //     .find(|statement| !is_formal_static_initializer(self.design, statement))
-        // {
-        //     return Err(ConvertError::source(
-        //         &initial.source,
-        //         "initial blocks are not supported by AIGER conversion",
-        //     ));
-        // }
-        // let all_statements = (&self.design.combinational)
-        //     .into_iter()
-        //     .chain(&self.design.sequential)
-        //     .cloned()
-        //     .collect::<Vec<_>>();
-        // let mut reads = BTreeSet::new();
-        // let mut writes = BTreeSet::new();
-        // all_statements
-        //     .as_slice()
-        //     .collect_accesses(&mut reads, &mut writes);
-        // loop {
-        //     let before = reads.len();
-        //     for (index, variable) in (&self.design.variables).into_iter().enumerate() {
-        //         let id = VariableId(index);
-        //         if reads.contains(&id)
-        //             && let Some(sampled) = &variable.sampled_value
-        //         {
-        //             sampled.collect_reads(&mut reads);
-        //         }
-        //     }
-        //     if reads.len() == before {
-        //         break;
-        //     }
-        // }
-        //
-        // let sequential = sequential::analyze(self.design).map_err(ConvertError::message)?;
-        // let mut register_ids = sequential.registers.clone();
-        // // Preserve the existing unpacked-array storage model for procedural
-        // // combinational element writes, which read the untouched elements.
-        // register_ids.extend(
-        //     (&self.design.variables)
-        //         .into_iter()
-        //         .enumerate()
-        //         .filter(|(index, variable)| {
-        //             self.design.data_type(variable.dtype).unpacked.is_some()
-        //                 && reads.contains(&VariableId(*index))
-        //                 && writes.contains(&VariableId(*index))
-        //         })
-        //         .map(|(index, _)| VariableId(index)),
-        // );
-        //
-        // let input_ids = (&self.design.variables)
-        //     .into_iter()
-        //     .enumerate()
-        //     .filter_map(|(index, variable)| {
-        //         let id = VariableId(index);
-        //         let primary_input = variable.direction == Direction::Input;
-        //         let undriven_read = reads.contains(&id)
-        //             && !writes.contains(&id)
-        //             && !register_ids.contains(&id)
-        //             && variable.sampled_value.is_none()
-        //             && !variable.internal;
-        //         ((primary_input || undriven_read) && id != self.clock.variable).then_some(id)
-        //     })
-        //     .collect::<BTreeSet<_>>();
-        //
-        // let mut environment = Environment::new();
-        // let mut inputs = Vec::new();
-        // for id in (0..self.design.variables.len())
-        //     .map(VariableId)
-        //     .filter(|id| input_ids.contains(id))
-        // {
-        //     let variable = self.design.variable(id);
-        //     let values = (0..self.design.data_type(variable.dtype).width)
-        //         .map(|_| ExprRef::from(self.fsm.add_variable_input()))
-        //         .collect::<Vec<_>>();
-        //     environment.insert(id, values.clone());
-        //     let signal = named_signal(self.design, variable, &values);
-        //     label_variables(&mut self.fsm, &signal);
-        //     inputs.push(signal);
-        // }
-        //
+        // TODO: why is this loop necessary
+        loop {
+            let before = reads.len();
+            for (index, variable) in (&self.design.variables).into_iter().enumerate() {
+                let id = VariableId(index);
+                if reads.contains(&id)
+                    && let Some(sampled) = &variable.sampled_value
+                {
+                    sampled.collect_reads(&mut reads);
+                }
+            }
+            if reads.len() == before {
+                break;
+            }
+        }
+
+        (reads, writes)
+    }
+
+    fn convert(mut self, ctx: &mut Context) -> Result<NamedFsm, ConvertError> {
+        // make sure that we can deal with all initial statements in the source
+        if let Some(initial) = (&self.design.initial)
+            .into_iter()
+            .find(|statement| !is_formal_static_initializer(self.design, statement))
+        {
+            return Err(ConvertError::source(
+                &initial.source,
+                "initial blocks are not supported by AIGER conversion",
+            ));
+        }
+
+        // calculate read/write set
+        let (reads, writes) = self.analyse_rw();
+
+        // determine registers
+        let sequential = sequential::analyze(self.design).map_err(ConvertError::message)?;
+        let mut register_ids = sequential.registers.clone();
+
+        // TODO: what does this mean?
+        // Preserve the existing unpacked-array storage model for procedural
+        // combinational element writes, which read the untouched elements.
+        register_ids.extend(
+            (&self.design.variables)
+                .into_iter()
+                .enumerate()
+                .filter(|(index, variable)| {
+                    self.design.data_type(variable.dtype).unpacked.is_some()
+                        && reads.contains(&VariableId(*index))
+                        && writes.contains(&VariableId(*index))
+                })
+                .map(|(index, _)| VariableId(index)),
+        );
+
+        // find inputs
+        let input_ids: Vec<_> = self
+            .design
+            .variables
+            .iter()
+            .enumerate()
+            .filter_map(|(index, variable)| {
+                let id = VariableId(index);
+                let primary_input = variable.direction == Direction::Input;
+                // TODO: what causes undriven reads?
+                let undriven_read = reads.contains(&id)
+                    && !writes.contains(&id)
+                    && !register_ids.contains(&id)
+                    && variable.sampled_value.is_none()
+                    && !variable.internal;
+                ((primary_input || undriven_read) && id != self.clock.variable).then_some(id)
+            })
+            .collect();
+
+        // the environment maps variables from the design to the transition system
+        let mut environment = Environment::new();
+
+        // add inputs to transition system
+        self.sys.inputs = input_ids
+            .into_iter()
+            .map(|id| {
+                let variable = self.design.variable(id);
+                let width = self.design.data_type(variable.dtype).width as WidthInt;
+                let sym = ctx.bv_symbol(&variable.name, width);
+                environment.insert(id, sym);
+                sym
+            })
+            .collect();
+
+        // add states to transition system (for now without next state or initial value)
+        self.sys.states = todo!("{}", self.sys.serialize_to_str(ctx))
+
         // let mut register_variables = BTreeMap::new();
         // let mut registers = Vec::new();
         // for id in (0..self.design.variables.len())

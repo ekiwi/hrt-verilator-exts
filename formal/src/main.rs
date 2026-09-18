@@ -93,7 +93,7 @@ fn main() -> ExitCode {
 
     let mut ctx = Context::default();
 
-    let mut model = match NamedFsm::from_design(&design, args.clock, args.reset) {
+    let mut model = match NamedFsm::from_design(&mut ctx, &design, args.clock, args.reset) {
         Ok(model) => model,
         Err(error) => {
             eprintln!("error: {error}");
