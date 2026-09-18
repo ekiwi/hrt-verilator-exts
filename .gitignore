@@ -2,3 +2,4 @@
 /simulator-rust/build/
 /tests/*/build/
 /tests/*/build-release/
+/.idea/

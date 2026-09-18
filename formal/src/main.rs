@@ -1,16 +1,13 @@
-use std::{fs, path::PathBuf, process::ExitCode};
-
 use clap::Parser;
-use formal_utils::{
-    formats::aiger::{AigerVersion, ascii::write_aiger_ascii, binary::write_aiger_binary},
-    fsm::{FSM, verify::VerifyOrdering},
-};
-
 use formal::convert::NamedFsm;
 use parser_verilator::{
     ast::{Design, Domain},
     document::AstDocument,
 };
+use patronus::expr::{Context, SerializableIrNode, TypeCheck, WidthInt};
+use patronus::system::TransitionSystem;
+use std::io::BufWriter;
+use std::{fs, path::PathBuf, process::ExitCode};
 
 #[derive(Debug, Parser)]
 #[command(about = "Convert a Verilator JSON AST to an ordered Boolean FSM")]
@@ -94,6 +91,8 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
+    let mut ctx = Context::default();
+
     let mut model = match NamedFsm::from_design(&design, args.clock, args.reset) {
         Ok(model) => model,
         Err(error) => {
@@ -107,44 +106,62 @@ fn main() -> ExitCode {
         "clock: {:?} edge of {}",
         model.clock.domain.edge, model.clock.domain.name
     );
+    debug_assert_eq!(model.inputs.len(), model.sys.inputs.len());
     println!(
         "inputs: {} signals, {} bits",
-        model.inputs.len(),
-        model.fsm.get_inputs().len()
+        model.sys.inputs.len(),
+        model
+            .sys
+            .inputs
+            .iter()
+            .map(|&i| ctx[i].get_bv_type(&ctx).unwrap())
+            .sum::<WidthInt>(),
     );
+    debug_assert_eq!(model.registers.len(), model.sys.states.len());
     println!(
         "registers: {} signals, {} bits",
-        model.registers.len(),
-        model.fsm.get_latches().len()
+        model.sys.states.len(),
+        model
+            .sys
+            .states
+            .iter()
+            .map(|&s| ctx[s.symbol].get_bv_type(&ctx).unwrap())
+            .sum::<WidthInt>(),
     );
+    debug_assert_eq!(model.outputs.len(), model.sys.outputs.len());
     println!(
         "outputs: {} signals, {} bits",
-        model.outputs.len(),
-        model.fsm.get_outputs().len()
+        model.sys.outputs.len(),
+        model
+            .sys
+            .outputs
+            .iter()
+            .map(|&o| ctx[o.expr].get_bv_type(&ctx).unwrap())
+            .sum::<WidthInt>(),
     );
-    println!("gates: {}", model.fsm.get_gates().len());
+    // println!("gates: {}", model.fsm.get_gates().len());
+    debug_assert_eq!(model.assertions.len(), model.sys.bad_states.len());
+    debug_assert_eq!(model.assumptions.len(), model.sys.constraints.len());
     println!(
         "properties: {} assertions, {} assumptions, {} covers",
-        model.assertions.len(),
+        model.sys.bad_states.len(),
         model.assumptions.len(),
         model.covers.len()
     );
 
-    if let Err(error) = select_property(&mut model.fsm, args.assert, args.cover) {
+    if let Err(error) = select_property(&ctx, &mut model.sys, args.assert, args.cover) {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
     }
     if args.debug {
-        print_aiger_symbols(&model.fsm);
+        println!("{}", model.sys.serialize_to_str(&ctx));
     }
     if args.zero_init {
         model.initialize_registers_to_zero();
     }
-    model.fsm.normalize_outputs();
-    model.fsm.reorder_gates();
-    model.fsm.verify(VerifyOrdering::Verify);
+
     if args.strip_symbols {
-        clear_symbols(&mut model.fsm);
+        todo!("not supported");
     }
 
     let extension = output
@@ -152,8 +169,12 @@ fn main() -> ExitCode {
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
     let contents = match extension.as_deref() {
-        Some("aag") => write_aiger_ascii(&model.fsm, AigerVersion::V1_9),
-        Some("aig") => write_aiger_binary(&model.fsm, AigerVersion::V1_9),
+        Some("btor") | Some("btor2") => {
+            let mut out = BufWriter::new(fs::File::create(&output).unwrap());
+            patronus::btor2::serialize(&ctx, &mut out, &model.sys).unwrap();
+        }
+        Some("aag") => todo!("bring back aiger support"),
+        Some("aig") => todo!("bring back aiger support"),
         _ => {
             eprintln!(
                 "error: output {} must have a .aag or .aig extension",
@@ -162,84 +183,36 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = fs::write(&output, contents) {
-        eprintln!("error: could not write {}: {error}", output.display());
-        return ExitCode::FAILURE;
-    }
     println!("wrote: {}", output.display());
 
     ExitCode::SUCCESS
 }
 
 fn select_property(
-    fsm: &mut FSM,
+    ctx: &Context,
+    sys: &mut TransitionSystem,
     assertion_index: Option<usize>,
     cover_index: Option<usize>,
 ) -> Result<(), String> {
-    if let Some(index) = assertion_index {
-        let count = fsm.get_asserts().len();
-        let assertion =
-            fsm.get_asserts().get(index).cloned().ok_or_else(|| {
-                format!("assertion index {index} is out of range (found {count})")
-            })?;
-        fsm.get_asserts_mut().clear();
-        fsm.get_asserts_mut().push(assertion);
-    } else if let Some(index) = cover_index {
-        let count = fsm.get_covers().len();
-        let (value, label) = fsm
-            .get_covers()
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("cover index {index} is out of range (found {count})"))?;
-        fsm.get_asserts_mut().clear();
-        fsm.get_asserts_mut().push((!value, label));
-    }
-    fsm.get_covers_mut().clear();
-    Ok(())
-}
-
-fn print_aiger_symbols(fsm: &FSM) {
-    for (index, input) in fsm.get_inputs().into_iter().enumerate() {
-        if let Some(label) = fsm.get_variable_label(input.index()) {
-            eprintln!("aiger symbol: i{index} {label}");
-        }
-    }
-    for (index, latch) in fsm.get_latches().into_iter().enumerate() {
-        if let Some(label) = fsm.get_variable_label(latch.output.index()) {
-            eprintln!("aiger symbol: l{index} {label}");
-        }
-    }
-    for (index, (_, label)) in fsm.get_outputs().into_iter().enumerate() {
-        if let Some(label) = label {
-            eprintln!("aiger symbol: o{index} {label}");
-        }
-    }
-    for (index, (_, label)) in fsm.get_asserts().into_iter().enumerate() {
-        if let Some(label) = label {
-            eprintln!("aiger symbol: b{index} {label}");
-        }
-    }
-    for (index, (_, label)) in fsm.get_assumes().into_iter().enumerate() {
-        if let Some(label) = label {
-            eprintln!("aiger symbol: c{index} {label}");
-        }
-    }
-}
-
-fn clear_symbols(fsm: &mut FSM) {
-    for variable_index in 0..fsm.get_num_variables() {
-        *fsm.get_variable_label_mut(variable_index) = None;
-    }
-    for (_, label) in fsm.get_outputs_mut() {
-        *label = None;
-    }
-    for (_, label) in fsm.get_asserts_mut() {
-        *label = None;
-    }
-    for (_, label) in fsm.get_assumes_mut() {
-        *label = None;
-    }
-    for (_, label) in fsm.get_covers_mut() {
-        *label = None;
-    }
+    todo!()
+    // if let Some(index) = assertion_index {
+    //     let count = fsm.get_asserts().len();
+    //     let assertion =
+    //         fsm.get_asserts().get(index).cloned().ok_or_else(|| {
+    //             format!("assertion index {index} is out of range (found {count})")
+    //         })?;
+    //     fsm.get_asserts_mut().clear();
+    //     fsm.get_asserts_mut().push(assertion);
+    // } else if let Some(index) = cover_index {
+    //     let count = fsm.get_covers().len();
+    //     let (value, label) = fsm
+    //         .get_covers()
+    //         .get(index)
+    //         .cloned()
+    //         .ok_or_else(|| format!("cover index {index} is out of range (found {count})"))?;
+    //     fsm.get_asserts_mut().clear();
+    //     fsm.get_asserts_mut().push((!value, label));
+    // }
+    // fsm.get_covers_mut().clear();
+    // Ok(())
 }

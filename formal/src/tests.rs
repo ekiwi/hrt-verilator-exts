@@ -6,15 +6,6 @@ use std::{
     time::Instant,
 };
 
-use formal_utils::{
-    formats::aiger::{
-        AigerVersion,
-        ascii::{read_aiger_ascii, write_aiger_ascii},
-        binary::write_aiger_binary,
-    },
-    fsm::{FSM, verify::VerifyOrdering},
-    sim::Simulator,
-};
 use parser_verilator::{
     ast::{BlockKind, Design, Domain, Edge, ExpressionKind, StatementKind},
     document::AstDocument,
