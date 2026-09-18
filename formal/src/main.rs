@@ -26,7 +26,7 @@ struct Args {
     #[arg(long)]
     reset: Option<Domain>,
 
-    /// Write AIGER 1.9; .aag selects ASCII and .aig selects binary.
+    /// Write btor.
     #[arg(short, long)]
     output: Option<PathBuf>,
 

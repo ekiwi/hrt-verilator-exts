@@ -1,14 +1,3 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    mem,
-};
-
-use formal_utils::{
-    fsm::{FSM, verify::VerifyOrdering},
-    gate::GateType,
-    sim::Simulator,
-    value::Value,
-};
 use parser_verilator::{
     ast::{
         AssignmentKind, AssignmentTarget, BinaryOperator, DataType, Design, Direction, Domain,
@@ -18,32 +7,32 @@ use parser_verilator::{
     },
     document::AstDocument,
 };
+use patronus::expr::ExprRef;
+use patronus::system::TransitionSystem;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
 
-use crate::ops::{Comparison, FsmOps, ShiftOperation};
+use crate::ops::{Comparison, ShiftOperation};
 
 pub use crate::error::ConvertError;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NamedBit {
-    pub index: isize,
-    pub value: Value,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedSignal {
     pub name: String,
-    pub bits: Vec<NamedBit>,
+    pub expr: ExprRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedProperty {
     pub name: String,
-    pub value: Value,
+    pub expr: ExprRef,
 }
 
 #[derive(Clone)]
 pub struct NamedFsm {
-    pub fsm: FSM,
+    pub sys: TransitionSystem,
     pub clock: SignalDomain,
     pub reset: Option<SignalDomain>,
     pub inputs: Vec<NamedSignal>,
@@ -65,14 +54,14 @@ impl NamedFsm {
     }
 }
 
-type Environment = BTreeMap<VariableId, Vec<Value>>;
+type Environment = BTreeMap<VariableId, Vec<ExprRef>>;
 type PropertyGroups = (Vec<NamedProperty>, Vec<NamedProperty>, Vec<NamedProperty>);
 
 struct Converter<'a> {
     design: &'a Design,
     clock: SignalDomain,
     reset: Option<SignalDomain>,
-    fsm: FSM,
+    sys: TransitionSystem,
     pending: Environment,
 }
 
@@ -85,7 +74,7 @@ impl TryFrom<&Design> for NamedFsm {
             design,
             clock,
             reset,
-            fsm: FSM::default(),
+            sys: TransitionSystem::new("todo".into()),
             pending: Environment::new(),
         }
         .convert()
@@ -234,11 +223,11 @@ fn signal_bit_names_as(signal: &NamedSignal, name: &str) -> Vec<String> {
     names
 }
 
-fn label_variables(fsm: &mut FSM, signal: &NamedSignal) {
-    label_variables_as(fsm, signal, &signal.name);
+fn label_variables(sys: &mut TransitionSystem, signal: &NamedSignal) {
+    label_variables_as(sys, signal, &signal.name);
 }
 
-fn label_variables_as(fsm: &mut FSM, signal: &NamedSignal, name: &str) {
+fn label_variables_as(sys: &mut TransitionSystem, signal: &NamedSignal, name: &str) {
     for (bit, name) in (&signal.bits)
         .into_iter()
         .zip(signal_bit_names_as(signal, name))
@@ -323,7 +312,7 @@ impl Converter<'_> {
         {
             let variable = self.design.variable(id);
             let values = (0..self.design.data_type(variable.dtype).width)
-                .map(|_| Value::from(self.fsm.add_variable_input()))
+                .map(|_| ExprRef::from(self.fsm.add_variable_input()))
                 .collect::<Vec<_>>();
             environment.insert(id, values.clone());
             let signal = named_signal(self.design, variable, &values);
@@ -339,7 +328,7 @@ impl Converter<'_> {
         {
             let variable = self.design.variable(id);
             let values = (0..self.design.data_type(variable.dtype).width)
-                .map(|_| Value::from(self.fsm.add_variable()))
+                .map(|_| ExprRef::from(self.fsm.add_variable()))
                 .collect::<Vec<_>>();
             environment.insert(id, values.clone());
             register_variables.insert(id, values.clone());
@@ -419,8 +408,8 @@ impl Converter<'_> {
     fn add_latches(
         &mut self,
         register: VariableId,
-        outputs: &[Value],
-        next: &[Value],
+        outputs: &[ExprRef],
+        next: &[ExprRef],
     ) -> Result<(), ConvertError> {
         if next.len() != outputs.len() {
             return Err(ConvertError::message(format!(
@@ -534,7 +523,7 @@ impl Converter<'_> {
     fn merge_environments(
         &mut self,
         source: &SourceInfo,
-        condition: Value,
+        condition: ExprRef,
         then_environment: &Environment,
         else_environment: &Environment,
         before: &Environment,
@@ -551,7 +540,7 @@ impl Converter<'_> {
                 .variables
                 .get(key.0)
                 .map_or(0, |variable| self.design.data_type(variable.dtype).width);
-            let default = vec![Value::Constant(false); width];
+            let default = vec![ExprRef::Constant(false); width];
             let then_value = then_environment
                 .get(&key)
                 .or_else(|| before.get(&key))
@@ -578,7 +567,7 @@ impl Converter<'_> {
     fn assign(
         &mut self,
         target: &AssignmentTarget,
-        value: Vec<Value>,
+        value: Vec<ExprRef>,
         environment: &mut Environment,
         evaluation: &Environment,
     ) -> Result<(), ConvertError> {
@@ -590,7 +579,7 @@ impl Converter<'_> {
                     .width;
                 environment.insert(
                     *variable,
-                    resize(value, width, false, Value::Constant(false)),
+                    resize(value, width, false, ExprRef::Constant(false)),
                 );
                 Ok(())
             }
@@ -658,7 +647,7 @@ impl Converter<'_> {
         target: &AssignmentTarget,
         environment: &Environment,
         evaluation: &Environment,
-    ) -> Result<Vec<Value>, ConvertError> {
+    ) -> Result<Vec<ExprRef>, ConvertError> {
         match target {
             AssignmentTarget::Variable { variable, .. } => {
                 environment.get(variable).cloned().ok_or_else(|| {
@@ -690,11 +679,11 @@ impl Converter<'_> {
         &mut self,
         expression: &Expression,
         environment: &Environment,
-    ) -> Result<Vec<Value>, ConvertError> {
+    ) -> Result<Vec<ExprRef>, ConvertError> {
         let width = self.design.data_type(expression.dtype).width;
         match &expression.kind {
             ExpressionKind::Constant(literal) => Ok((0..width)
-                .map(|bit| Value::Constant(literal.value.bit(bit as u64)))
+                .map(|bit| ExprRef::Constant(literal.value.bit(bit as u64)))
                 .collect()),
             ExpressionKind::Variable { variable, .. } => {
                 if let Some(value) = environment.get(variable) {
@@ -728,13 +717,13 @@ impl Converter<'_> {
                     self.expression(then_value, environment)?,
                     width,
                     false,
-                    Value::Constant(false),
+                    ExprRef::Constant(false),
                 );
                 let else_value = resize(
                     self.expression(else_value, environment)?,
                     width,
                     false,
-                    Value::Constant(false),
+                    ExprRef::Constant(false),
                 );
                 Ok(FsmOps::create_mux(
                     &mut self.fsm,
@@ -777,27 +766,27 @@ impl Converter<'_> {
         operator: UnaryOperator,
         operand: &Expression,
         environment: &Environment,
-    ) -> Result<Vec<Value>, ConvertError> {
+    ) -> Result<Vec<ExprRef>, ConvertError> {
         let value = self.expression(operand, environment)?;
         let width = self.design.data_type(expression.dtype).width;
         Ok(match operator {
             UnaryOperator::BitwiseNot => value.into_iter().map(|value| !value).collect(),
             UnaryOperator::Negate => {
-                let zero = vec![Value::Constant(false); value.len()];
+                let zero = vec![ExprRef::Constant(false); value.len()];
                 FsmOps::create_subtraction(&mut self.fsm, &zero, &value)
             }
             UnaryOperator::ReduceAnd => vec![self.fsm.add_variable_gate(GateType::And, value)],
             UnaryOperator::ReduceOr => vec![self.fsm.add_variable_gate(GateType::Or, value)],
             UnaryOperator::ReduceXor => {
-                let mut result = Value::Constant(false);
+                let mut result = ExprRef::Constant(false);
                 for value in value {
                     result = FsmOps::create_xor_gate(&mut self.fsm, result, value);
                 }
                 vec![result]
             }
             UnaryOperator::LogicalNot => vec![!self.truthy(&value)],
-            UnaryOperator::ZeroExtend => resize(value, width, false, Value::Constant(false)),
-            UnaryOperator::SignExtend => resize(value, width, true, Value::Constant(false)),
+            UnaryOperator::ZeroExtend => resize(value, width, false, ExprRef::Constant(false)),
+            UnaryOperator::SignExtend => resize(value, width, true, ExprRef::Constant(false)),
         })
     }
 
@@ -808,22 +797,22 @@ impl Converter<'_> {
         lhs: &Expression,
         rhs: &Expression,
         environment: &Environment,
-    ) -> Result<Vec<Value>, ConvertError> {
+    ) -> Result<Vec<ExprRef>, ConvertError> {
         let width = self.design.data_type(expression.dtype).width;
         let lhs_value = self.expression(lhs, environment)?;
         let rhs_value = self.expression(rhs, environment)?;
         Ok(match operator {
             BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOr | BinaryOperator::BitwiseXor => {
-                let lhs = resize(lhs_value, width, false, Value::Constant(false));
-                let rhs = resize(rhs_value, width, false, Value::Constant(false));
+                let lhs = resize(lhs_value, width, false, ExprRef::Constant(false));
+                let rhs = resize(rhs_value, width, false, ExprRef::Constant(false));
                 lhs.into_iter()
                     .zip(rhs)
                     .map(|(lhs, rhs)| match operator {
-                        BinaryOperator::BitwiseAnd => {
-                            Value::from(self.fsm.add_variable_gate_binary(GateType::And, lhs, rhs))
-                        }
+                        BinaryOperator::BitwiseAnd => ExprRef::from(
+                            self.fsm.add_variable_gate_binary(GateType::And, lhs, rhs),
+                        ),
                         BinaryOperator::BitwiseOr => {
-                            Value::from(self.fsm.add_variable_gate_binary(GateType::Or, lhs, rhs))
+                            ExprRef::from(self.fsm.add_variable_gate_binary(GateType::Or, lhs, rhs))
                         }
                         BinaryOperator::BitwiseXor => {
                             FsmOps::create_xor_gate(&mut self.fsm, lhs, rhs)
@@ -834,8 +823,8 @@ impl Converter<'_> {
             }
             BinaryOperator::Add | BinaryOperator::Subtract => {
                 let signed = self.design.data_type(expression.dtype).signed;
-                let lhs = resize(lhs_value, width, signed, Value::Constant(false));
-                let rhs = resize(rhs_value, width, signed, Value::Constant(false));
+                let lhs = resize(lhs_value, width, signed, ExprRef::Constant(false));
+                let rhs = resize(rhs_value, width, signed, ExprRef::Constant(false));
                 if operator == BinaryOperator::Add {
                     FsmOps::create_addition(&mut self.fsm, &lhs, &rhs)
                 } else {
@@ -844,18 +833,18 @@ impl Converter<'_> {
             }
             BinaryOperator::MultiplyUnsigned | BinaryOperator::MultiplySigned => {
                 let signed = operator == BinaryOperator::MultiplySigned;
-                let lhs = resize(lhs_value, width, signed, Value::Constant(false));
-                let rhs = resize(rhs_value, width, signed, Value::Constant(false));
+                let lhs = resize(lhs_value, width, signed, ExprRef::Constant(false));
+                let rhs = resize(rhs_value, width, signed, ExprRef::Constant(false));
                 FsmOps::create_multiplication(&mut self.fsm, &lhs, &rhs)
             }
             BinaryOperator::DivideUnsigned => {
-                let lhs = resize(lhs_value, width, false, Value::Constant(false));
-                let rhs = resize(rhs_value, width, false, Value::Constant(false));
+                let lhs = resize(lhs_value, width, false, ExprRef::Constant(false));
+                let rhs = resize(rhs_value, width, false, ExprRef::Constant(false));
                 FsmOps::create_unsigned_division(&mut self.fsm, &lhs, &rhs)
             }
             BinaryOperator::DivideSigned => {
-                let lhs = resize(lhs_value, width, true, Value::Constant(false));
-                let rhs = resize(rhs_value, width, true, Value::Constant(false));
+                let lhs = resize(lhs_value, width, true, ExprRef::Constant(false));
+                let rhs = resize(rhs_value, width, true, ExprRef::Constant(false));
                 FsmOps::create_signed_division(&mut self.fsm, &lhs, &rhs)
             }
             BinaryOperator::Equal
@@ -873,8 +862,8 @@ impl Converter<'_> {
                     || operator == BinaryOperator::LessThanOrEqualSigned
                     || operator == BinaryOperator::GreaterThanSigned
                     || operator == BinaryOperator::GreaterThanOrEqualSigned;
-                let mut lhs = resize(lhs_value, width, signed, Value::Constant(false));
-                let mut rhs = resize(rhs_value, width, signed, Value::Constant(false));
+                let mut lhs = resize(lhs_value, width, signed, ExprRef::Constant(false));
+                let mut rhs = resize(rhs_value, width, signed, ExprRef::Constant(false));
                 if signed && width != 0 {
                     lhs[width - 1] = !lhs[width - 1];
                     rhs[width - 1] = !rhs[width - 1];
@@ -909,7 +898,7 @@ impl Converter<'_> {
                 } else {
                     GateType::Or
                 };
-                vec![Value::from(
+                vec![ExprRef::from(
                     self.fsm.add_variable_gate_binary(gate, lhs, rhs),
                 )]
             }
@@ -929,11 +918,11 @@ impl Converter<'_> {
     fn shift(
         &mut self,
         operator: BinaryOperator,
-        value: Vec<Value>,
-        shift: Vec<Value>,
+        value: Vec<ExprRef>,
+        shift: Vec<ExprRef>,
         width: usize,
-    ) -> Vec<Value> {
-        let value = resize(value, width, false, Value::Constant(false));
+    ) -> Vec<ExprRef> {
+        let value = resize(value, width, false, ExprRef::Constant(false));
         let padded_width = width.next_power_of_two();
         let useful_shift_bits = if padded_width <= 1 {
             0
@@ -947,7 +936,7 @@ impl Converter<'_> {
             shift.clone(),
             useful_shift_bits,
             false,
-            Value::Constant(false),
+            ExprRef::Constant(false),
         );
         let operation = match operator {
             BinaryOperator::ShiftLeft => ShiftOperation::ShiftLeft,
@@ -958,7 +947,7 @@ impl Converter<'_> {
         let fill = if operation == ShiftOperation::ShiftRightArithmetic {
             *value.last().unwrap()
         } else {
-            Value::Constant(false)
+            ExprRef::Constant(false)
         };
         let padded_value = resize(value, padded_width, false, fill);
         let mut result =
@@ -974,11 +963,11 @@ impl Converter<'_> {
 
     fn select_value(
         &mut self,
-        value: Vec<Value>,
+        value: Vec<ExprRef>,
         offset: &Expression,
         width: usize,
         environment: &Environment,
-    ) -> Result<Vec<Value>, ConvertError> {
+    ) -> Result<Vec<ExprRef>, ConvertError> {
         if let ExpressionKind::Constant(literal) = &offset.kind {
             let offset = usize::try_from(&literal.value).unwrap();
             return Ok(value[offset..offset + width].to_vec());
@@ -992,7 +981,7 @@ impl Converter<'_> {
             offset_value.clone(),
             useful_offset_bits,
             false,
-            Value::Constant(false),
+            ExprRef::Constant(false),
         );
         let mut result = (0..width)
             .map(|bit| {
@@ -1001,7 +990,7 @@ impl Converter<'_> {
                         value
                             .get(candidate_offset + bit)
                             .copied()
-                            .unwrap_or(Value::Constant(false))
+                            .unwrap_or(ExprRef::Constant(false))
                     })
                     .collect::<Vec<_>>();
                 self.select_without_or(&choices, &low_offset)
@@ -1009,7 +998,7 @@ impl Converter<'_> {
             .collect::<Vec<_>>();
         if offset_value.len() > useful_offset_bits {
             let oversized = self.truthy(&offset_value[useful_offset_bits..]);
-            let zero = vec![Value::Constant(false); width];
+            let zero = vec![ExprRef::Constant(false); width];
             result = FsmOps::create_mux(&mut self.fsm, &result, &zero, oversized);
         }
         Ok(result)
@@ -1017,14 +1006,14 @@ impl Converter<'_> {
 
     fn array_select_value(
         &mut self,
-        array: Vec<Value>,
+        array: Vec<ExprRef>,
         index: &Expression,
         dtype: &DataType,
         environment: &Environment,
-    ) -> Result<Vec<Value>, ConvertError> {
+    ) -> Result<Vec<ExprRef>, ConvertError> {
         let layout = dtype.unpacked.as_ref().unwrap();
         let index = self.expression(index, environment)?;
-        let mut result = vec![Value::Constant(false); layout.element_width];
+        let mut result = vec![ExprRef::Constant(false); layout.element_width];
         for (offset, declared_index) in layout.indices.into_iter().enumerate() {
             let candidate = usize_values(usize::try_from(declared_index).unwrap(), index.len());
             let selected = self.equals_constant_without_or(&index, &candidate);
@@ -1035,7 +1024,7 @@ impl Converter<'_> {
         Ok(result)
     }
 
-    fn truthy(&mut self, value: &[Value]) -> Value {
+    fn truthy(&mut self, value: &[ExprRef]) -> ExprRef {
         if value.len() == 1 {
             value[0]
         } else {
@@ -1043,12 +1032,12 @@ impl Converter<'_> {
         }
     }
 
-    fn equals_constant_without_or(&mut self, value: &[Value], constant: &[Value]) -> Value {
+    fn equals_constant_without_or(&mut self, value: &[ExprRef], constant: &[ExprRef]) -> ExprRef {
         let equal_bits = value
             .into_iter()
             .zip(constant)
             .map(|(&value, &constant)| {
-                if constant == Value::Constant(true) {
+                if constant == ExprRef::Constant(true) {
                     value
                 } else {
                     !value
@@ -1058,30 +1047,36 @@ impl Converter<'_> {
         self.fsm.add_variable_gate(GateType::And, equal_bits)
     }
 
-    fn mux_value_without_or(&mut self, lhs: Value, rhs: Value, select: Value) -> Value {
-        let select_lhs = Value::from(self.fsm.add_variable_gate_binary(
+    fn mux_value_without_or(&mut self, lhs: ExprRef, rhs: ExprRef, select: ExprRef) -> ExprRef {
+        let select_lhs = ExprRef::from(self.fsm.add_variable_gate_binary(
             GateType::And,
             lhs,
             !select,
         ));
-        let select_rhs = Value::from(
-            self.fsm
-                .add_variable_gate_binary(GateType::And, rhs, select),
-        );
-        !Value::from(
+        let select_rhs = ExprRef::from(self.fsm.add_variable_gate_binary(
+            GateType::And,
+            rhs,
+            select,
+        ));
+        !ExprRef::from(
             self.fsm
                 .add_variable_gate_binary(GateType::And, !select_lhs, !select_rhs),
         )
     }
 
-    fn mux_without_or(&mut self, lhs: &[Value], rhs: &[Value], select: Value) -> Vec<Value> {
+    fn mux_without_or(
+        &mut self,
+        lhs: &[ExprRef],
+        rhs: &[ExprRef],
+        select: ExprRef,
+    ) -> Vec<ExprRef> {
         lhs.into_iter()
             .zip(rhs)
             .map(|(&lhs, &rhs)| self.mux_value_without_or(lhs, rhs, select))
             .collect()
     }
 
-    fn select_without_or(&mut self, values: &[Value], index: &[Value]) -> Value {
+    fn select_without_or(&mut self, values: &[ExprRef], index: &[ExprRef]) -> ExprRef {
         let mut level = values.to_vec();
         for &select in index {
             let mut next = Vec::with_capacity(level.len() / 2);
@@ -1178,7 +1173,7 @@ fn formal_history_initial_value(variable: &Variable) -> Option<bool> {
     (variable.kind == VariableKind::ModuleTemporary && formal_history).then_some(false)
 }
 
-fn named_signal(design: &Design, variable: &Variable, values: &[Value]) -> NamedSignal {
+fn named_signal(design: &Design, variable: &Variable, values: &[ExprRef]) -> NamedSignal {
     NamedSignal {
         name: variable.display_name().to_string(),
         bits: design
@@ -1191,7 +1186,7 @@ fn named_signal(design: &Design, variable: &Variable, values: &[Value]) -> Named
     }
 }
 
-fn resize(mut value: Vec<Value>, width: usize, signed: bool, fill: Value) -> Vec<Value> {
+fn resize(mut value: Vec<ExprRef>, width: usize, signed: bool, fill: ExprRef) -> Vec<ExprRef> {
     let fill = if signed {
         *value.last().unwrap_or(&fill)
     } else {
@@ -1202,9 +1197,9 @@ fn resize(mut value: Vec<Value>, width: usize, signed: bool, fill: Value) -> Vec
     value
 }
 
-fn usize_values(value: usize, width: usize) -> Vec<Value> {
+fn usize_values(value: usize, width: usize) -> Vec<ExprRef> {
     (0..width)
-        .map(|bit| Value::Constant(bit < usize::BITS as usize && ((value >> bit) & 1) == 1))
+        .map(|bit| ExprRef::Constant(bit < usize::BITS as usize && ((value >> bit) & 1) == 1))
         .collect()
 }
 
@@ -1254,23 +1249,23 @@ fn apply_reset(model: &mut NamedFsm, reset: &SignalDomain) -> Result<(), Convert
     Ok(())
 }
 
-fn rebuild_with_tied_input(fsm: &FSM, tied_input: usize, value: bool) -> (FSM, Vec<Value>) {
+fn rebuild_with_tied_input(fsm: &FSM, tied_input: usize, value: bool) -> (FSM, Vec<ExprRef>) {
     let mut rebuilt = FSM::default();
-    let mut mapping = vec![Value::Constant(false); fsm.get_num_variables()];
-    mapping[tied_input] = Value::Constant(value);
+    let mut mapping = vec![ExprRef::Constant(false); fsm.get_num_variables()];
+    mapping[tied_input] = ExprRef::Constant(value);
 
     for input in fsm.get_inputs() {
         if input.index() == tied_input {
             continue;
         }
         let new_input = rebuilt.add_variable_input();
-        mapping[input.index()] = Value::from(new_input);
+        mapping[input.index()] = ExprRef::from(new_input);
         *rebuilt.get_variable_label_mut(new_input.index()) =
             fsm.get_variable_label(input.index()).clone();
     }
     for latch in fsm.get_latches() {
         let new_output = rebuilt.add_variable();
-        mapping[latch.output.index()] = Value::from(new_output);
+        mapping[latch.output.index()] = ExprRef::from(new_output);
     }
     for gate in fsm.get_gates() {
         let new_output = rebuilt.add_variable();
@@ -1280,7 +1275,7 @@ fn rebuild_with_tied_input(fsm: &FSM, tied_input: usize, value: bool) -> (FSM, V
             remap_value(gate.a, &mapping),
             remap_value(gate.b, &mapping),
         );
-        mapping[gate.output.index()] = Value::from(new_output);
+        mapping[gate.output.index()] = ExprRef::from(new_output);
         *rebuilt.get_variable_label_mut(new_output.index()) =
             fsm.get_variable_label(gate.output.index()).clone();
     }
@@ -1315,11 +1310,11 @@ fn rebuild_with_tied_input(fsm: &FSM, tied_input: usize, value: bool) -> (FSM, V
     (rebuilt, mapping)
 }
 
-fn remap_value(value: Value, mapping: &[Value]) -> Value {
+fn remap_value(value: ExprRef, mapping: &[ExprRef]) -> ExprRef {
     value.map_variable_value(|variable| mapping[variable.index()].xor(!variable.sign()))
 }
 
-fn remap_model_values(model: &mut NamedFsm, mapping: &[Value]) {
+fn remap_model_values(model: &mut NamedFsm, mapping: &[ExprRef]) {
     for signal in (&mut model.inputs)
         .into_iter()
         .chain(&mut model.registers)
@@ -1342,7 +1337,7 @@ fn reorder_model(model: &mut NamedFsm) {
     let variable_count = model.fsm.get_num_variables();
     let mut mapping = (0..variable_count).collect::<Vec<_>>();
     model.fsm.reorder_gates_with(|old, new| mapping[old] = new);
-    let remap = |value: &mut Value| {
+    let remap = |value: &mut ExprRef| {
         *value = value.map_variable(|variable| (variable.sign(), mapping[variable.index()]).into());
     };
     for signal in (&mut model.inputs)
