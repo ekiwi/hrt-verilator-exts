@@ -79,6 +79,7 @@ version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5bfd336df246850cbf45d23c607f75df3c893b446dee16c4ff7a1e3f26a233c6"
 dependencies = [
+ "num-bigint",
  "paste",
  "rand",
 ]
@@ -201,6 +202,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "formal"
 version = "0.1.0"
 dependencies = [
+ "baa",
  "clap",
  "parser-verilator",
  "patronus",
@@ -315,9 +317,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.5.1"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",

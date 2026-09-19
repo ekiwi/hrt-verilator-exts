@@ -1,3 +1,4 @@
+pub use crate::error::ConvertError;
 use crate::ops::{Comparison, ShiftOperation};
 use parser_verilator::{
     ast::{
@@ -8,14 +9,13 @@ use parser_verilator::{
     },
     document::AstDocument,
 };
-use patronus::expr::{Context, ExprRef, SerializableIrNode, WidthInt};
-use patronus::system::TransitionSystem;
+use patronus::expr::{Context, ExprRef, SerializableIrNode, TypeCheck, WidthInt};
+use patronus::system::{State, TransitionSystem};
+use std::cmp::Ordering;
 use std::{
     collections::{BTreeMap, BTreeSet},
     mem,
 };
-
-pub use crate::error::ConvertError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedSignal {
@@ -317,26 +317,26 @@ impl Converter<'_> {
             .collect();
 
         // add states to transition system (for now without next state or initial value)
-        self.sys.states = todo!("{}", self.sys.serialize_to_str(ctx))
+        self.sys.states = register_ids
+            .into_iter()
+            .map(|id| {
+                let variable = self.design.variable(id);
+                let width = self.design.data_type(variable.dtype).width as WidthInt;
+                let symbol = ctx.bv_symbol(&variable.name, width);
+                environment.insert(id, symbol);
+                State {
+                    symbol,
+                    init: None,
+                    next: None,
+                }
+            })
+            .collect();
 
-        // let mut register_variables = BTreeMap::new();
-        // let mut registers = Vec::new();
-        // for id in (0..self.design.variables.len())
-        //     .map(VariableId)
-        //     .filter(|id| register_ids.contains(id))
-        // {
-        //     let variable = self.design.variable(id);
-        //     let values = (0..self.design.data_type(variable.dtype).width)
-        //         .map(|_| ExprRef::from(self.fsm.add_variable()))
-        //         .collect::<Vec<_>>();
-        //     environment.insert(id, values.clone());
-        //     register_variables.insert(id, values.clone());
-        //     let signal = named_signal(self.design, variable, &values);
-        //     label_variables(&mut self.fsm, &signal);
-        //     registers.push(signal);
-        // }
+        self.execute_combinational(&self.design.combinational, &mut environment)?;
+
+        todo!("{}", self.sys.serialize_to_str(ctx))
+
         //
-        // self.execute_combinational(&self.design.combinational, &mut environment)?;
         // // Freeze sampled expressions before any clocked blocking assignments run.
         // let before_edge = environment.clone();
         // for (index, variable) in (&self.design.variables).into_iter().enumerate() {
@@ -424,100 +424,95 @@ impl Converter<'_> {
     //     Ok(())
     // }
     //
-    // fn execute_combinational(
-    //     &mut self,
-    //     statements: &[Statement],
-    //     environment: &mut Environment,
-    // ) -> Result<(), ConvertError> {
-    //     let mut pending = statements.into_iter().collect::<Vec<_>>();
-    //     while !pending.is_empty() {
-    //         let Some(index) = (&pending).into_iter().position(|statement| {
-    //             let mut reads = BTreeSet::new();
-    //             statement.collect_reads(&mut reads);
-    //             reads.into_iter().all(|id| environment.contains_key(&id))
-    //         }) else {
-    //             return Err(ConvertError::message(
-    //                 "combinational logic has a cycle or unresolved input",
-    //             ));
-    //         };
-    //         let statement = pending.remove(index);
-    //         self.execute(statement, environment).map_err(|error| {
-    //             ConvertError::source(
-    //                 &statement.source,
-    //                 format!("combinational evaluation failed: {error}"),
-    //             )
-    //         })?;
-    //     }
-    //     Ok(())
-    // }
-    //
-    // fn execute_all(
-    //     &mut self,
-    //     statements: &[Statement],
-    //     environment: &mut Environment,
-    // ) -> Result<(), ConvertError> {
-    //     for statement in statements {
-    //         self.execute(statement, environment)?;
-    //     }
-    //     Ok(())
-    // }
-    //
-    // fn execute(
-    //     &mut self,
-    //     statement: &Statement,
-    //     environment: &mut Environment,
-    // ) -> Result<(), ConvertError> {
-    //     match &statement.kind {
-    //         StatementKind::Block { statements, .. } => self.execute_all(statements, environment),
-    //         StatementKind::Assignment {
-    //             kind,
-    //             target,
-    //             value,
-    //         } => {
-    //             let value = self.expression(value, environment)?;
-    //             if *kind == AssignmentKind::Nonblocking {
-    //                 let mut pending = mem::take(&mut self.pending);
-    //                 let result = self.assign(target, value, &mut pending, environment);
-    //                 self.pending = pending;
-    //                 result
-    //             } else {
-    //                 let evaluation = environment.clone();
-    //                 self.assign(target, value, environment, &evaluation)
-    //             }
-    //         }
-    //         StatementKind::If {
-    //             condition,
-    //             then_statements,
-    //             else_statements,
-    //         } => {
-    //             let condition_value = self.expression(condition, environment)?;
-    //             let condition = self.truthy(&condition_value);
-    //             let before = environment.clone();
-    //             let pending_before = self.pending.clone();
-    //             let mut then_environment = before.clone();
-    //             self.execute_all(then_statements, &mut then_environment)?;
-    //             let then_pending = mem::replace(&mut self.pending, pending_before);
-    //             let mut else_environment = before.clone();
-    //             self.execute_all(else_statements, &mut else_environment)?;
-    //             let else_pending = mem::take(&mut self.pending);
-    //             self.pending = self.merge_environments(
-    //                 &statement.source,
-    //                 condition,
-    //                 &then_pending,
-    //                 &else_pending,
-    //                 &Environment::new(),
-    //             )?;
-    //             *environment = self.merge_environments(
-    //                 &statement.source,
-    //                 condition,
-    //                 &then_environment,
-    //                 &else_environment,
-    //                 &before,
-    //             )?;
-    //             Ok(())
-    //         }
-    //     }
-    // }
+    fn execute_combinational(
+        &mut self,
+        statements: &[Statement],
+        environment: &mut Environment,
+    ) -> Result<(), ConvertError> {
+        let mut pending = statements.into_iter().collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let Some(index) = (&pending).into_iter().position(|statement| {
+                let mut reads = BTreeSet::new();
+                statement.collect_reads(&mut reads);
+                reads.into_iter().all(|id| environment.contains_key(&id))
+            }) else {
+                return Err(ConvertError::message(
+                    "combinational logic has a cycle or unresolved input",
+                ));
+            };
+            let statement = pending.remove(index);
+            self.on_stmt(statement, environment).map_err(|error| {
+                ConvertError::source(
+                    &statement.source,
+                    format!("combinational evaluation failed: {error}"),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn on_stmt(
+        &mut self,
+        ctx: &mut Context,
+        statement: &Statement,
+        environment: &mut Environment,
+    ) -> Result<(), ConvertError> {
+        match &statement.kind {
+            StatementKind::Block { statements, .. } => {
+                for stmt in statements {
+                    self.on_stmt(stmt, environment)?;
+                }
+                Ok(())
+            }
+            StatementKind::Assignment {
+                kind,
+                target,
+                value,
+            } => {
+                let value = self.on_bv_expr(ctx, value, environment)?;
+                if *kind == AssignmentKind::Nonblocking {
+                    let mut pending = mem::take(&mut self.pending);
+                    let result = self.assign(target, value, &mut pending, environment);
+                    self.pending = pending;
+                    result
+                } else {
+                    let evaluation = environment.clone();
+                    self.assign(target, value, environment, &evaluation)
+                }
+            }
+            StatementKind::If {
+                condition,
+                then_statements,
+                else_statements,
+            } => {
+                let condition_value = self.on_bv_expr(condition, environment)?;
+                let condition = self.truthy(&condition_value);
+                let before = environment.clone();
+                let pending_before = self.pending.clone();
+                let mut then_environment = before.clone();
+                self.execute_all(then_statements, &mut then_environment)?;
+                let then_pending = mem::replace(&mut self.pending, pending_before);
+                let mut else_environment = before.clone();
+                self.execute_all(else_statements, &mut else_environment)?;
+                let else_pending = mem::take(&mut self.pending);
+                self.pending = self.merge_environments(
+                    &statement.source,
+                    condition,
+                    &then_pending,
+                    &else_pending,
+                    &Environment::new(),
+                )?;
+                *environment = self.merge_environments(
+                    &statement.source,
+                    condition,
+                    &then_environment,
+                    &else_environment,
+                    &before,
+                )?;
+                Ok(())
+            }
+        }
+    }
     //
     // fn merge_environments(
     //     &mut self,
@@ -674,291 +669,236 @@ impl Converter<'_> {
     //     }
     // }
     //
-    // fn expression(
-    //     &mut self,
-    //     expression: &Expression,
-    //     environment: &Environment,
-    // ) -> Result<Vec<ExprRef>, ConvertError> {
-    //     let width = self.design.data_type(expression.dtype).width;
-    //     match &expression.kind {
-    //         ExpressionKind::Constant(literal) => Ok((0..width)
-    //             .map(|bit| ExprRef::Constant(literal.value.bit(bit as u64)))
-    //             .collect()),
-    //         ExpressionKind::Variable { variable, .. } => {
-    //             if let Some(value) = environment.get(variable) {
-    //                 return Ok(value.clone());
-    //             }
-    //             if let Some(sampled) = &self.design.variable(*variable).sampled_value {
-    //                 return self.expression(sampled, environment);
-    //             }
-    //             Err(ConvertError::source(
-    //                 &expression.source,
-    //                 format!(
-    //                     "unresolved symbolic variable {}",
-    //                     self.design.variable(*variable).display_name()
-    //                 ),
-    //             ))
-    //         }
-    //         ExpressionKind::Unary { operator, operand } => {
-    //             self.unary_expression(expression, *operator, operand, environment)
-    //         }
-    //         ExpressionKind::Binary { operator, lhs, rhs } => {
-    //             self.binary_expression(expression, *operator, lhs, rhs, environment)
-    //         }
-    //         ExpressionKind::Conditional {
-    //             condition,
-    //             then_value,
-    //             else_value,
-    //         } => {
-    //             let condition_value = self.expression(condition, environment)?;
-    //             let select = self.truthy(&condition_value);
-    //             let then_value = resize(
-    //                 self.expression(then_value, environment)?,
-    //                 width,
-    //                 false,
-    //                 ExprRef::Constant(false),
-    //             );
-    //             let else_value = resize(
-    //                 self.expression(else_value, environment)?,
-    //                 width,
-    //                 false,
-    //                 ExprRef::Constant(false),
-    //             );
-    //             Ok(FsmOps::create_mux(
-    //                 &mut self.fsm,
-    //                 &else_value,
-    //                 &then_value,
-    //                 select,
-    //             ))
-    //         }
-    //         ExpressionKind::Replicate { source, count, .. } => {
-    //             let source = self.expression(source, environment)?;
-    //             let mut result = Vec::with_capacity(width);
-    //             for _ in 0..*count {
-    //                 result.extend(&source);
-    //             }
-    //             Ok(result)
-    //         }
-    //         ExpressionKind::Select {
-    //             value,
-    //             offset,
-    //             width,
-    //         } => {
-    //             let value = self.expression(value, environment)?;
-    //             self.select_value(value, offset, *width, environment)
-    //         }
-    //         ExpressionKind::ArraySelect { array, index } => {
-    //             let value = self.expression(array, environment)?;
-    //             self.array_select_value(
-    //                 value,
-    //                 index,
-    //                 self.design.data_type(array.dtype),
-    //                 environment,
-    //             )
-    //         }
-    //     }
-    // }
-    //
-    // fn unary_expression(
-    //     &mut self,
-    //     expression: &Expression,
-    //     operator: UnaryOperator,
-    //     operand: &Expression,
-    //     environment: &Environment,
-    // ) -> Result<Vec<ExprRef>, ConvertError> {
-    //     let value = self.expression(operand, environment)?;
-    //     let width = self.design.data_type(expression.dtype).width;
-    //     Ok(match operator {
-    //         UnaryOperator::BitwiseNot => value.into_iter().map(|value| !value).collect(),
-    //         UnaryOperator::Negate => {
-    //             let zero = vec![ExprRef::Constant(false); value.len()];
-    //             FsmOps::create_subtraction(&mut self.fsm, &zero, &value)
-    //         }
-    //         UnaryOperator::ReduceAnd => vec![self.fsm.add_variable_gate(GateType::And, value)],
-    //         UnaryOperator::ReduceOr => vec![self.fsm.add_variable_gate(GateType::Or, value)],
-    //         UnaryOperator::ReduceXor => {
-    //             let mut result = ExprRef::Constant(false);
-    //             for value in value {
-    //                 result = FsmOps::create_xor_gate(&mut self.fsm, result, value);
-    //             }
-    //             vec![result]
-    //         }
-    //         UnaryOperator::LogicalNot => vec![!self.truthy(&value)],
-    //         UnaryOperator::ZeroExtend => resize(value, width, false, ExprRef::Constant(false)),
-    //         UnaryOperator::SignExtend => resize(value, width, true, ExprRef::Constant(false)),
-    //     })
-    // }
-    //
-    // fn binary_expression(
-    //     &mut self,
-    //     expression: &Expression,
-    //     operator: BinaryOperator,
-    //     lhs: &Expression,
-    //     rhs: &Expression,
-    //     environment: &Environment,
-    // ) -> Result<Vec<ExprRef>, ConvertError> {
-    //     let width = self.design.data_type(expression.dtype).width;
-    //     let lhs_value = self.expression(lhs, environment)?;
-    //     let rhs_value = self.expression(rhs, environment)?;
-    //     Ok(match operator {
-    //         BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOr | BinaryOperator::BitwiseXor => {
-    //             let lhs = resize(lhs_value, width, false, ExprRef::Constant(false));
-    //             let rhs = resize(rhs_value, width, false, ExprRef::Constant(false));
-    //             lhs.into_iter()
-    //                 .zip(rhs)
-    //                 .map(|(lhs, rhs)| match operator {
-    //                     BinaryOperator::BitwiseAnd => ExprRef::from(
-    //                         self.fsm.add_variable_gate_binary(GateType::And, lhs, rhs),
-    //                     ),
-    //                     BinaryOperator::BitwiseOr => {
-    //                         ExprRef::from(self.fsm.add_variable_gate_binary(GateType::Or, lhs, rhs))
-    //                     }
-    //                     BinaryOperator::BitwiseXor => {
-    //                         FsmOps::create_xor_gate(&mut self.fsm, lhs, rhs)
-    //                     }
-    //                     _ => unreachable!(),
-    //                 })
-    //                 .collect()
-    //         }
-    //         BinaryOperator::Add | BinaryOperator::Subtract => {
-    //             let signed = self.design.data_type(expression.dtype).signed;
-    //             let lhs = resize(lhs_value, width, signed, ExprRef::Constant(false));
-    //             let rhs = resize(rhs_value, width, signed, ExprRef::Constant(false));
-    //             if operator == BinaryOperator::Add {
-    //                 FsmOps::create_addition(&mut self.fsm, &lhs, &rhs)
-    //             } else {
-    //                 FsmOps::create_subtraction(&mut self.fsm, &lhs, &rhs)
-    //             }
-    //         }
-    //         BinaryOperator::MultiplyUnsigned | BinaryOperator::MultiplySigned => {
-    //             let signed = operator == BinaryOperator::MultiplySigned;
-    //             let lhs = resize(lhs_value, width, signed, ExprRef::Constant(false));
-    //             let rhs = resize(rhs_value, width, signed, ExprRef::Constant(false));
-    //             FsmOps::create_multiplication(&mut self.fsm, &lhs, &rhs)
-    //         }
-    //         BinaryOperator::DivideUnsigned => {
-    //             let lhs = resize(lhs_value, width, false, ExprRef::Constant(false));
-    //             let rhs = resize(rhs_value, width, false, ExprRef::Constant(false));
-    //             FsmOps::create_unsigned_division(&mut self.fsm, &lhs, &rhs)
-    //         }
-    //         BinaryOperator::DivideSigned => {
-    //             let lhs = resize(lhs_value, width, true, ExprRef::Constant(false));
-    //             let rhs = resize(rhs_value, width, true, ExprRef::Constant(false));
-    //             FsmOps::create_signed_division(&mut self.fsm, &lhs, &rhs)
-    //         }
-    //         BinaryOperator::Equal
-    //         | BinaryOperator::NotEqual
-    //         | BinaryOperator::LessThanUnsigned
-    //         | BinaryOperator::LessThanOrEqualUnsigned
-    //         | BinaryOperator::GreaterThanUnsigned
-    //         | BinaryOperator::GreaterThanOrEqualUnsigned
-    //         | BinaryOperator::LessThanSigned
-    //         | BinaryOperator::LessThanOrEqualSigned
-    //         | BinaryOperator::GreaterThanSigned
-    //         | BinaryOperator::GreaterThanOrEqualSigned => {
-    //             let width = lhs_value.len().max(rhs_value.len());
-    //             let signed = operator == BinaryOperator::LessThanSigned
-    //                 || operator == BinaryOperator::LessThanOrEqualSigned
-    //                 || operator == BinaryOperator::GreaterThanSigned
-    //                 || operator == BinaryOperator::GreaterThanOrEqualSigned;
-    //             let mut lhs = resize(lhs_value, width, signed, ExprRef::Constant(false));
-    //             let mut rhs = resize(rhs_value, width, signed, ExprRef::Constant(false));
-    //             if signed && width != 0 {
-    //                 lhs[width - 1] = !lhs[width - 1];
-    //                 rhs[width - 1] = !rhs[width - 1];
-    //             }
-    //             let comparison = match operator {
-    //                 BinaryOperator::Equal => Comparison::Equals,
-    //                 BinaryOperator::NotEqual => Comparison::NotEquals,
-    //                 BinaryOperator::LessThanUnsigned | BinaryOperator::LessThanSigned => {
-    //                     Comparison::LessThan
-    //                 }
-    //                 BinaryOperator::LessThanOrEqualUnsigned
-    //                 | BinaryOperator::LessThanOrEqualSigned => Comparison::LessThanOrEqual,
-    //                 BinaryOperator::GreaterThanUnsigned | BinaryOperator::GreaterThanSigned => {
-    //                     Comparison::GreaterThan
-    //                 }
-    //                 BinaryOperator::GreaterThanOrEqualUnsigned
-    //                 | BinaryOperator::GreaterThanOrEqualSigned => Comparison::GreaterThanOrEqual,
-    //                 _ => unreachable!(),
-    //             };
-    //             vec![FsmOps::create_comparison(
-    //                 &mut self.fsm,
-    //                 &lhs,
-    //                 &rhs,
-    //                 comparison,
-    //             )]
-    //         }
-    //         BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
-    //             let lhs = self.truthy(&lhs_value);
-    //             let rhs = self.truthy(&rhs_value);
-    //             let gate = if operator == BinaryOperator::LogicalAnd {
-    //                 GateType::And
-    //             } else {
-    //                 GateType::Or
-    //             };
-    //             vec![ExprRef::from(
-    //                 self.fsm.add_variable_gate_binary(gate, lhs, rhs),
-    //             )]
-    //         }
-    //         BinaryOperator::ShiftLeft
-    //         | BinaryOperator::ShiftRight
-    //         | BinaryOperator::ShiftRightArithmetic => {
-    //             self.shift(operator, lhs_value, rhs_value, width)
-    //         }
-    //         BinaryOperator::Concat => {
-    //             let mut result = rhs_value;
-    //             result.extend(lhs_value);
-    //             result
-    //         }
-    //     })
-    // }
-    //
-    // fn shift(
-    //     &mut self,
-    //     operator: BinaryOperator,
-    //     value: Vec<ExprRef>,
-    //     shift: Vec<ExprRef>,
-    //     width: usize,
-    // ) -> Vec<ExprRef> {
-    //     let value = resize(value, width, false, ExprRef::Constant(false));
-    //     let padded_width = width.next_power_of_two();
-    //     let useful_shift_bits = if padded_width <= 1 {
-    //         0
-    //     } else {
-    //         padded_width.trailing_zeros() as usize
-    //     };
-    //     if useful_shift_bits == 0 {
-    //         return value;
-    //     }
-    //     let low_shift = resize(
-    //         shift.clone(),
-    //         useful_shift_bits,
-    //         false,
-    //         ExprRef::Constant(false),
-    //     );
-    //     let operation = match operator {
-    //         BinaryOperator::ShiftLeft => ShiftOperation::ShiftLeft,
-    //         BinaryOperator::ShiftRight => ShiftOperation::ShiftRight,
-    //         BinaryOperator::ShiftRightArithmetic => ShiftOperation::ShiftRightArithmetic,
-    //         _ => unreachable!(),
-    //     };
-    //     let fill = if operation == ShiftOperation::ShiftRightArithmetic {
-    //         *value.last().unwrap()
-    //     } else {
-    //         ExprRef::Constant(false)
-    //     };
-    //     let padded_value = resize(value, padded_width, false, fill);
-    //     let mut result =
-    //         FsmOps::create_shifter(&mut self.fsm, &padded_value, &low_shift, operation);
-    //     result.truncate(width);
-    //     if shift.len() > useful_shift_bits {
-    //         let oversized = self.truthy(&shift[useful_shift_bits..]);
-    //         let saturated = vec![fill; width];
-    //         result = FsmOps::create_mux(&mut self.fsm, &result, &saturated, oversized);
-    //     }
-    //     result
-    // }
+    fn on_bv_expr(
+        &mut self,
+        ctx: &mut Context,
+        expression: &Expression,
+        environment: &Environment,
+    ) -> Result<ExprRef, ConvertError> {
+        let width = self.design.data_type(expression.dtype).width as WidthInt;
+        match &expression.kind {
+            ExpressionKind::Constant(literal) => {
+                let value = baa::BitVecValue::from_big_uint(&literal.value, width);
+                Ok(ctx.bv_lit(&value.into()))
+            }
+            ExpressionKind::Variable { variable, .. } => {
+                if let Some(&value) = environment.get(variable) {
+                    return Ok(value);
+                }
+                // TODO: what does sampled mean in this context?
+                if let Some(sampled) = &self.design.variable(*variable).sampled_value {
+                    return self.on_bv_expr(ctx, sampled, environment);
+                }
+                Err(ConvertError::source(
+                    &expression.source,
+                    format!(
+                        "unresolved symbolic variable {}",
+                        self.design.variable(*variable).display_name()
+                    ),
+                ))
+            }
+            ExpressionKind::Unary { operator, operand } => {
+                self.unary_expression(ctx, expression, *operator, operand, environment)
+            }
+            ExpressionKind::Binary { operator, lhs, rhs } => {
+                self.binary_expression(ctx, expression, *operator, lhs, rhs, environment)
+            }
+            ExpressionKind::Conditional {
+                condition,
+                then_value,
+                else_value,
+            } => {
+                let condition_value = self.on_bv_expr(condition, environment)?;
+                let select = self.truthy(&condition_value);
+                let then_value = resize(
+                    self.on_bv_expr(then_value, environment)?,
+                    width,
+                    false,
+                    ExprRef::Constant(false),
+                );
+                let else_value = resize(
+                    self.on_bv_expr(else_value, environment)?,
+                    width,
+                    false,
+                    ExprRef::Constant(false),
+                );
+                Ok(FsmOps::create_mux(
+                    &mut self.fsm,
+                    &else_value,
+                    &then_value,
+                    select,
+                ))
+            }
+            ExpressionKind::Replicate { source, count, .. } => {
+                let source = self.on_bv_expr(source, environment)?;
+                let mut result = Vec::with_capacity(width);
+                for _ in 0..*count {
+                    result.extend(&source);
+                }
+                Ok(result)
+            }
+            ExpressionKind::Select {
+                value,
+                offset,
+                width,
+            } => {
+                let value = self.on_bv_expr(value, environment)?;
+                self.select_value(value, offset, *width, environment)
+            }
+            ExpressionKind::ArraySelect { array, index } => {
+                let value = self.on_bv_expr(array, environment)?;
+                self.array_select_value(
+                    value,
+                    index,
+                    self.design.data_type(array.dtype),
+                    environment,
+                )
+            }
+        }
+    }
+
+    fn unary_expression(
+        &mut self,
+        ctx: &mut Context,
+        expression: &Expression,
+        operator: UnaryOperator,
+        operand: &Expression,
+        environment: &Environment,
+    ) -> Result<ExprRef, ConvertError> {
+        let expr = self.on_bv_expr(ctx, operand, environment)?;
+        let width = self.design.data_type(expression.dtype).width as WidthInt;
+        Ok(match operator {
+            UnaryOperator::BitwiseNot | UnaryOperator::Negate => {
+                let in_width = ctx[expr].get_bv_type(ctx).unwrap();
+                assert_eq!(in_width, width, "TODO: zero or sign extend");
+                match operator {
+                    UnaryOperator::BitwiseNot => ctx.not(expr),
+                    UnaryOperator::Negate => ctx.negate(expr),
+                    _ => unreachable!(),
+                }
+            }
+            UnaryOperator::LogicalNot => {
+                let bit = self.truthy(ctx, expr);
+                ctx.not(bit)
+            }
+            UnaryOperator::ReduceAnd => todo!("and reductions"),
+            UnaryOperator::ReduceOr => todo!("or reductions"),
+            UnaryOperator::ReduceXor => todo!("xor reductions"),
+            UnaryOperator::ZeroExtend => ext_or_truncate(ctx, expr, width, false),
+            UnaryOperator::SignExtend => ext_or_truncate(ctx, expr, width, true),
+        })
+    }
+
+    fn binary_expression(
+        &mut self,
+        ctx: &mut Context,
+        expression: &Expression,
+        operator: BinaryOperator,
+        lhs: &Expression,
+        rhs: &Expression,
+        environment: &Environment,
+    ) -> Result<ExprRef, ConvertError> {
+        let width = self.design.data_type(expression.dtype).width as WidthInt;
+        let lhs_value = self.on_bv_expr(ctx, lhs, environment)?;
+        let rhs_value = self.on_bv_expr(ctx, rhs, environment)?;
+        Ok(match operator {
+            BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOr | BinaryOperator::BitwiseXor => {
+                let lhs = ext_or_truncate(ctx, lhs_value, width, false);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, false);
+                match operator {
+                    BinaryOperator::BitwiseAnd => ctx.and(lhs, rhs),
+                    BinaryOperator::BitwiseOr => ctx.or(lhs, rhs),
+                    BinaryOperator::BitwiseXor => ctx.xor(lhs, rhs),
+                    _ => unreachable!(),
+                }
+            }
+            BinaryOperator::Add | BinaryOperator::Subtract => {
+                let signed = self.design.data_type(expression.dtype).signed;
+                let lhs = ext_or_truncate(ctx, lhs_value, width, signed);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, signed);
+                if operator == BinaryOperator::Add {
+                    ctx.add(lhs, rhs)
+                } else {
+                    ctx.sub(lhs, rhs)
+                }
+            }
+            BinaryOperator::MultiplyUnsigned | BinaryOperator::MultiplySigned => {
+                let signed = operator == BinaryOperator::MultiplySigned;
+                let lhs = ext_or_truncate(ctx, lhs_value, width, signed);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, signed);
+                ctx.mul(lhs, rhs)
+            }
+            BinaryOperator::DivideUnsigned => {
+                let lhs = ext_or_truncate(ctx, lhs_value, width, false);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, false);
+                ctx.div(lhs, rhs)
+            }
+            BinaryOperator::DivideSigned => {
+                let lhs = ext_or_truncate(ctx, lhs_value, width, true);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, true);
+                ctx.signed_div(lhs, rhs)
+            }
+            BinaryOperator::Equal
+            | BinaryOperator::NotEqual
+            | BinaryOperator::LessThanUnsigned
+            | BinaryOperator::LessThanOrEqualUnsigned
+            | BinaryOperator::GreaterThanUnsigned
+            | BinaryOperator::GreaterThanOrEqualUnsigned
+            | BinaryOperator::LessThanSigned
+            | BinaryOperator::LessThanOrEqualSigned
+            | BinaryOperator::GreaterThanSigned
+            | BinaryOperator::GreaterThanOrEqualSigned => {
+                let lhs_value_width = ctx[lhs_value].get_bv_type(ctx).unwrap();
+                let rhs_value_width = ctx[rhs_value].get_bv_type(ctx).unwrap();
+                let width = lhs_value_width.max(rhs_value_width);
+                let signed = operator == BinaryOperator::LessThanSigned
+                    || operator == BinaryOperator::LessThanOrEqualSigned
+                    || operator == BinaryOperator::GreaterThanSigned
+                    || operator == BinaryOperator::GreaterThanOrEqualSigned;
+                let lhs = ext_or_truncate(ctx, lhs_value, width, signed);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, signed);
+                match operator {
+                    BinaryOperator::Equal => ctx.equal(lhs, rhs),
+                    BinaryOperator::NotEqual => ctx.build(|b| b.not(b.equal(lhs, rhs))),
+                    // a < b <=> b > a
+                    BinaryOperator::LessThanUnsigned => ctx.greater(rhs, lhs),
+                    BinaryOperator::LessThanSigned => ctx.greater_signed(rhs, lhs),
+                    // a <= b <=> b >= a
+                    BinaryOperator::LessThanOrEqualUnsigned => ctx.greater_or_equal(rhs, lhs),
+                    BinaryOperator::LessThanOrEqualSigned => ctx.greater_or_equal_signed(rhs, lhs),
+                    BinaryOperator::GreaterThanUnsigned => ctx.greater(lhs, rhs),
+                    BinaryOperator::GreaterThanSigned => ctx.greater_signed(lhs, rhs),
+                    BinaryOperator::GreaterThanOrEqualUnsigned => ctx.greater_or_equal(lhs, rhs),
+                    BinaryOperator::GreaterThanOrEqualSigned => {
+                        ctx.greater_or_equal_signed(lhs, rhs)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr => {
+                let lhs = self.truthy(ctx, lhs_value);
+                let rhs = self.truthy(ctx, rhs_value);
+                if operator == BinaryOperator::LogicalAnd {
+                    ctx.and(lhs, rhs)
+                } else {
+                    ctx.or(lhs, rhs)
+                }
+            }
+            BinaryOperator::ShiftLeft
+            | BinaryOperator::ShiftRight
+            | BinaryOperator::ShiftRightArithmetic => {
+                let lhs = ext_or_truncate(ctx, lhs_value, width, false);
+                let rhs = ext_or_truncate(ctx, rhs_value, width, false);
+                match operator {
+                    BinaryOperator::ShiftLeft => ctx.shift_left(lhs, rhs),
+                    BinaryOperator::ShiftRight => ctx.shift_right(lhs, rhs),
+                    BinaryOperator::ShiftRightArithmetic => ctx.arithmetic_shift_right(lhs, rhs),
+                    _ => unreachable!(),
+                }
+            }
+            BinaryOperator::Concat => ctx.concat(lhs_value, rhs_value),
+        })
+    }
     //
     // fn select_value(
     //     &mut self,
@@ -1023,13 +963,13 @@ impl Converter<'_> {
     //     Ok(result)
     // }
     //
-    // fn truthy(&mut self, value: &[ExprRef]) -> ExprRef {
-    //     if value.len() == 1 {
-    //         value[0]
-    //     } else {
-    //         self.fsm.add_variable_gate(GateType::Or, value.to_vec())
-    //     }
-    // }
+    fn truthy(&mut self, ctx: &mut Context, value: ExprRef) -> ExprRef {
+        if ctx[value].get_bv_type(ctx).unwrap() == 1 {
+            value
+        } else {
+            todo!("implement or reduction")
+        }
+    }
     //
     // fn equals_constant_without_or(&mut self, value: &[ExprRef], constant: &[ExprRef]) -> ExprRef {
     //     let equal_bits = value
@@ -1193,15 +1133,14 @@ fn named_signal(
     todo!()
 }
 
-fn resize(mut value: Vec<ExprRef>, width: usize, signed: bool, fill: ExprRef) -> Vec<ExprRef> {
-    let fill = if signed {
-        *value.last().unwrap_or(&fill)
-    } else {
-        fill
-    };
-    value.truncate(width);
-    value.resize(width, fill);
-    value
+fn ext_or_truncate(ctx: &mut Context, e: ExprRef, out_width: WidthInt, signed: bool) -> ExprRef {
+    let in_width = ctx[e].get_bv_type(ctx).unwrap();
+    match in_width.cmp(&out_width) {
+        Ordering::Less if signed => ctx.sign_extend(e, out_width - in_width),
+        Ordering::Less => ctx.zero_extend(e, out_width - in_width),
+        Ordering::Equal => e,
+        Ordering::Greater => ctx.slice(e, out_width - 1, 0),
+    }
 }
 
 // fn usize_values(value: usize, width: usize) -> Vec<ExprRef> {
