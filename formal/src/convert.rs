@@ -1,11 +1,9 @@
 pub use crate::error::ConvertError;
-use crate::ops::{Comparison, ShiftOperation};
 use parser_verilator::{
     ast::{
-        AssignmentKind, AssignmentTarget, BinaryOperator, DataType, Design, Direction, Domain,
-        Edge, Expression, ExpressionKind, PropertyKind, SignalDomain, SourceInfo, Statement,
-        StatementKind, UnaryOperator, Variable, VariableId, VariableKind, collect::CollectAccesses,
-        sequential,
+        AssignmentKind, AssignmentTarget, BinaryOperator, Design, Direction, Domain, Expression,
+        ExpressionKind, SignalDomain, Statement, StatementKind, UnaryOperator, Variable,
+        VariableId, VariableKind, collect::CollectAccesses, sequential,
     },
     document::AstDocument,
 };
@@ -426,6 +424,7 @@ impl Converter<'_> {
     //
     fn execute_combinational(
         &mut self,
+        ctx: &mut Context,
         statements: &[Statement],
         environment: &mut Environment,
     ) -> Result<(), ConvertError> {
@@ -441,7 +440,7 @@ impl Converter<'_> {
                 ));
             };
             let statement = pending.remove(index);
-            self.on_stmt(statement, environment).map_err(|error| {
+            self.on_stmt(ctx, statement, environment).map_err(|error| {
                 ConvertError::source(
                     &statement.source,
                     format!("combinational evaluation failed: {error}"),
@@ -460,7 +459,7 @@ impl Converter<'_> {
         match &statement.kind {
             StatementKind::Block { statements, .. } => {
                 for stmt in statements {
-                    self.on_stmt(stmt, environment)?;
+                    self.on_stmt(ctx, stmt, environment)?;
                 }
                 Ok(())
             }
@@ -708,41 +707,30 @@ impl Converter<'_> {
                 then_value,
                 else_value,
             } => {
-                let condition_value = self.on_bv_expr(condition, environment)?;
-                let select = self.truthy(&condition_value);
-                let then_value = resize(
-                    self.on_bv_expr(then_value, environment)?,
-                    width,
-                    false,
-                    ExprRef::Constant(false),
-                );
-                let else_value = resize(
-                    self.on_bv_expr(else_value, environment)?,
-                    width,
-                    false,
-                    ExprRef::Constant(false),
-                );
-                Ok(FsmOps::create_mux(
-                    &mut self.fsm,
-                    &else_value,
-                    &then_value,
-                    select,
-                ))
+                let condition_value = self.on_bv_expr(ctx, condition, environment)?;
+                let select = self.truthy(ctx, condition_value);
+                let then_value = self.on_bv_expr(ctx, then_value, environment)?;
+                let then_value = ext_or_truncate(ctx, then_value, width, false);
+                let else_value = self.on_bv_expr(ctx, else_value, environment)?;
+                let else_value = ext_or_truncate(ctx, else_value, width, false);
+                Ok(ctx.ite(select, then_value, else_value))
             }
             ExpressionKind::Replicate { source, count, .. } => {
-                let source = self.on_bv_expr(source, environment)?;
-                let mut result = Vec::with_capacity(width);
-                for _ in 0..*count {
-                    result.extend(&source);
+                let source = self.on_bv_expr(ctx, source, environment)?;
+                let source_width = ctx[source].get_bv_type(ctx).unwrap();
+                assert_eq!(source_width * *count as u32, width);
+                let mut out = source;
+                for _ in 1..*count {
+                    out = ctx.concat(out, source);
                 }
-                Ok(result)
+                Ok(out)
             }
             ExpressionKind::Select {
                 value,
                 offset,
                 width,
             } => {
-                let value = self.on_bv_expr(value, environment)?;
+                let value = self.on_bv_expr(ctx, value, environment)?;
                 self.select_value(value, offset, *width, environment)
             }
             ExpressionKind::ArraySelect { array, index } => {
@@ -900,48 +888,49 @@ impl Converter<'_> {
         })
     }
     //
-    // fn select_value(
-    //     &mut self,
-    //     value: Vec<ExprRef>,
-    //     offset: &Expression,
-    //     width: usize,
-    //     environment: &Environment,
-    // ) -> Result<Vec<ExprRef>, ConvertError> {
-    //     if let ExpressionKind::Constant(literal) = &offset.kind {
-    //         let offset = usize::try_from(&literal.value).unwrap();
-    //         return Ok(value[offset..offset + width].to_vec());
-    //     }
-    //     let offset_value = self.expression(offset, environment)?;
-    //     let choice_count = value.len().checked_next_power_of_two().ok_or_else(|| {
-    //         ConvertError::source(&offset.source, "dynamic selection input is too wide")
-    //     })?;
-    //     let useful_offset_bits = choice_count.trailing_zeros() as usize;
-    //     let low_offset = resize(
-    //         offset_value.clone(),
-    //         useful_offset_bits,
-    //         false,
-    //         ExprRef::Constant(false),
-    //     );
-    //     let mut result = (0..width)
-    //         .map(|bit| {
-    //             let choices = (0..choice_count)
-    //                 .map(|candidate_offset| {
-    //                     value
-    //                         .get(candidate_offset + bit)
-    //                         .copied()
-    //                         .unwrap_or(ExprRef::Constant(false))
-    //                 })
-    //                 .collect::<Vec<_>>();
-    //             self.select_without_or(&choices, &low_offset)
-    //         })
-    //         .collect::<Vec<_>>();
-    //     if offset_value.len() > useful_offset_bits {
-    //         let oversized = self.truthy(&offset_value[useful_offset_bits..]);
-    //         let zero = vec![ExprRef::Constant(false); width];
-    //         result = FsmOps::create_mux(&mut self.fsm, &result, &zero, oversized);
-    //     }
-    //     Ok(result)
-    // }
+    fn select_value(
+        &mut self,
+        ctx: &mut Context,
+        value: ExprRef,
+        offset: ExprRef,
+        width: usize,
+        environment: &Environment,
+    ) -> Result<Vec<ExprRef>, ConvertError> {
+        if let ExpressionKind::Constant(literal) = &offset.kind {
+            let offset = usize::try_from(&literal.value).unwrap();
+            return Ok(value[offset..offset + width].to_vec());
+        }
+        let offset_value = self.expression(offset, environment)?;
+        let choice_count = value.len().checked_next_power_of_two().ok_or_else(|| {
+            ConvertError::source(&offset.source, "dynamic selection input is too wide")
+        })?;
+        let useful_offset_bits = choice_count.trailing_zeros() as usize;
+        let low_offset = resize(
+            offset_value.clone(),
+            useful_offset_bits,
+            false,
+            ExprRef::Constant(false),
+        );
+        let mut result = (0..width)
+            .map(|bit| {
+                let choices = (0..choice_count)
+                    .map(|candidate_offset| {
+                        value
+                            .get(candidate_offset + bit)
+                            .copied()
+                            .unwrap_or(ExprRef::Constant(false))
+                    })
+                    .collect::<Vec<_>>();
+                self.select_without_or(&choices, &low_offset)
+            })
+            .collect::<Vec<_>>();
+        if offset_value.len() > useful_offset_bits {
+            let oversized = self.truthy(&offset_value[useful_offset_bits..]);
+            let zero = vec![ExprRef::Constant(false); width];
+            result = FsmOps::create_mux(&mut self.fsm, &result, &zero, oversized);
+        }
+        Ok(result)
+    }
     //
     // fn array_select_value(
     //     &mut self,
@@ -1142,12 +1131,6 @@ fn ext_or_truncate(ctx: &mut Context, e: ExprRef, out_width: WidthInt, signed: b
         Ordering::Greater => ctx.slice(e, out_width - 1, 0),
     }
 }
-
-// fn usize_values(value: usize, width: usize) -> Vec<ExprRef> {
-//     (0..width)
-//         .map(|bit| ExprRef::Constant(bit < usize::BITS as usize && ((value >> bit) & 1) == 1))
-//         .collect()
-// }
 
 fn apply_reset(model: &mut NamedFsm, reset: &SignalDomain) -> Result<(), ConvertError> {
     let reset_signal = (&model.inputs)
