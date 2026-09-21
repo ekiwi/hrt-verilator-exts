@@ -50,6 +50,10 @@ struct Args {
     /// Print every AIGER symbol that would normally be written.
     #[arg(long)]
     debug: bool,
+
+    /// Simplifies the transition system before serializing.
+    #[arg(long)]
+    simplify: bool,
 }
 
 fn main() -> ExitCode {
@@ -153,11 +157,23 @@ fn main() -> ExitCode {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
     }
+
+    if args.zero_init {
+        for state in model.sys.states.iter_mut() {
+            if let Some(width) = state.symbol.get_bv_type(&ctx) {
+                state.init = Some(ctx.zero(width));
+            } else {
+                todo!("add support for array state")
+            }
+        }
+    }
+
+    if args.simplify {
+        patronus::system::transform::simplify_expressions(&mut ctx, &mut model.sys);
+    }
+
     if args.debug {
         println!("{}", model.sys.serialize_to_str(&ctx));
-    }
-    if args.zero_init {
-        model.initialize_registers_to_zero();
     }
 
     if args.strip_symbols {
@@ -168,7 +184,7 @@ fn main() -> ExitCode {
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
-    let contents = match extension.as_deref() {
+    match extension.as_deref() {
         Some("btor") | Some("btor2") => {
             let mut out = BufWriter::new(fs::File::create(&output).unwrap());
             patronus::btor2::serialize(&ctx, &mut out, &model.sys).unwrap();

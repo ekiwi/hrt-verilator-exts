@@ -1,7 +1,5 @@
 pub use crate::error::ConvertError;
-use clap::builder::Str;
-use parser_verilator::ast::DataTypeKind::PackedArray;
-use parser_verilator::ast::{PropertyKind, SourceInfo};
+use parser_verilator::ast::{Edge, PropertyKind, SourceInfo};
 use parser_verilator::{
     ast::{
         AssignmentKind, AssignmentTarget, BinaryOperator, Design, Direction, Domain, Expression,
@@ -10,7 +8,7 @@ use parser_verilator::{
     },
     document::AstDocument,
 };
-use patronus::expr::{Context, ExprRef, SerializableIrNode, TypeCheck, WidthInt};
+use patronus::expr::{Context, Expr, ExprRef, Simplifier, SparseExprMap, TypeCheck, WidthInt};
 use patronus::system::{Output, State, TransitionSystem};
 use std::cmp::Ordering;
 use std::{
@@ -36,18 +34,6 @@ pub struct NamedFsm {
     pub clock: SignalDomain,
     pub reset: Option<SignalDomain>,
     pub properties: Properties,
-}
-
-impl NamedFsm {
-    pub fn initialize_registers_to_zero(&mut self) {
-        // for latch in self.fsm.get_latches() {
-        //     self.fsm
-        //         .get_latch_mut(latch.output.index())
-        //         .unwrap()
-        //         .reset_value = Some(false);
-        // }
-        todo!()
-    }
 }
 
 type Environment = BTreeMap<VariableId, ExprRef>;
@@ -171,50 +157,6 @@ fn resolve_reset(design: &Design, reset: &Domain) -> Result<SignalDomain, Conver
         variable: VariableId(index),
         domain: reset.clone(),
     })
-}
-
-fn sanitize_symbol(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character == '\n' || character == '\r' {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect()
-}
-
-fn signal_bit_names(signal: &NamedSignal) -> Vec<String> {
-    signal_bit_names_as(signal, &signal.name)
-}
-
-fn signal_bit_names_as(signal: &NamedSignal, name: &str) -> Vec<String> {
-    todo!()
-    // let mut names = Vec::new();
-    // if signal.bits.len() == 1 {
-    //     names.push(name.to_string());
-    // } else {
-    //     for bit in &signal.bits {
-    //         names.push(format!("{}[{}]", name, bit.index));
-    //     }
-    // }
-    // names
-}
-
-fn label_variables(sys: &mut TransitionSystem, signal: &NamedSignal) {
-    label_variables_as(sys, signal, &signal.name);
-}
-
-fn label_variables_as(sys: &mut TransitionSystem, signal: &NamedSignal, name: &str) {
-    // for (bit, name) in (&signal.bits)
-    //     .into_iter()
-    //     .zip(signal_bit_names_as(signal, name))
-    // {
-    //     let variable = bit.value.unwrap_variable();
-    //     *fsm.get_variable_label_mut(variable.index()) = Some(sanitize_symbol(&name));
-    // }
-    todo!()
 }
 
 #[derive(Debug, Default, Clone)]
@@ -397,6 +339,10 @@ impl Converter<'_> {
         }
 
         let props = self.add_properties(ctx, &environment)?;
+
+        if let Some(reset) = &self.reset {
+            apply_reset(ctx, &mut self.sys, reset)?;
+        }
 
         Ok((self.sys, props))
     }
@@ -1021,7 +967,8 @@ impl Converter<'_> {
             // TODO: add a way to name properties to the TransitionSystem API
             match property.kind {
                 PropertyKind::Assertion => {
-                    self.sys.bad_states.push(ctx.not(value));
+                    // TODO: we would expect to have to invert the property here, but somehow it does not appear to work. Why?
+                    self.sys.bad_states.push(value);
                     p.asserts.push(name);
                 }
                 PropertyKind::Assumption => {
@@ -1073,27 +1020,6 @@ fn is_formal_history_register(variable: &Variable) -> bool {
     variable.kind == VariableKind::ModuleTemporary && formal_history
 }
 
-fn named_signal(
-    ctx: &mut Context,
-    design: &Design,
-    variable: &Variable,
-    values: &[ExprRef],
-) -> NamedSignal {
-    // let width = design.data_type(variable.dtype).indices.into_iter().count()
-    // let symbol =
-    // NamedSignal {
-    //     name: variable.display_name().to_string(),
-    //     bits: design
-    //         .data_type(variable.dtype)
-    //         .indices
-    //         .into_iter()
-    //         .zip(values.to_vec())
-    //         .map(|(index, value)| NamedBit { index, value })
-    //         .collect(),
-    // }
-    todo!()
-}
-
 fn ext_or_truncate(ctx: &mut Context, e: ExprRef, out_width: WidthInt, signed: bool) -> ExprRef {
     let in_width = ctx[e].get_bv_type(ctx).unwrap();
     match in_width.cmp(&out_width) {
@@ -1104,49 +1030,63 @@ fn ext_or_truncate(ctx: &mut Context, e: ExprRef, out_width: WidthInt, signed: b
     }
 }
 
-fn apply_reset(model: &mut NamedFsm, reset: &SignalDomain) -> Result<(), ConvertError> {
-    // let reset_signal = (&model.inputs)
-    //     .into_iter()
-    //     .find(|signal| signal.name == reset.domain.name)
-    //     .ok_or_else(|| {
-    //         ConvertError::message(format!(
-    //             "reset input {} was not converted",
-    //             reset.domain.name
-    //         ))
-    //     })?;
-    todo!()
-    // if reset_signal.bits.len() != 1 {
-    //     return Err(ConvertError::message(format!(
-    //         "reset input {} must be one bit wide",
-    //         reset.domain.name
-    //     )));
-    // }
-    // let reset_variable = reset_signal.bits[0]
-    //     .value
-    //     .get_variable()
-    //     .ok_or_else(|| ConvertError::message("reset input unexpectedly became constant"))?;
-    // let asserted = reset.domain.edge == Edge::Positive;
-    // let mut simulator = Simulator::from(model.fsm.clone());
-    // simulator.set_input(reset_variable.index(), Some(asserted));
-    // simulator.eval();
-    // simulator.step();
-    //
-    // for latch in model.fsm.get_latches() {
-    //     let reset_value = simulator
-    //         .get_variable_signed(latch.output)
-    //         .or(latch.reset_value);
-    //     model
-    //         .fsm
-    //         .get_latch_mut(latch.output.index())
-    //         .unwrap()
-    //         .reset_value = reset_value;
-    // }
-    //
-    // let (fsm, mapping) = rebuild_with_tied_input(&model.fsm, reset_variable.index(), !asserted);
-    // model.fsm = fsm;
-    // remap_model_values(model, &mapping);
-    // model
-    //     .inputs
-    //     .retain(|signal| signal.name != reset.domain.name);
-    // Ok(())
+fn apply_reset(
+    ctx: &mut Context,
+    sys: &mut TransitionSystem,
+    reset: &SignalDomain,
+) -> Result<(), ConvertError> {
+    let reset_signal = (&sys.inputs)
+        .into_iter()
+        .find(|signal| ctx.get_symbol_name(**signal) == Some(&reset.domain.name))
+        .cloned()
+        .ok_or_else(|| {
+            ConvertError::message(format!(
+                "reset input {} was not converted",
+                reset.domain.name
+            ))
+        })?;
+
+    if reset_signal.get_bv_type(ctx) != Some(1) {
+        return Err(ConvertError::message(format!(
+            "reset input {} must be one bit wide",
+            reset.domain.name
+        )));
+    }
+
+    let high_active = reset.domain.edge == Edge::Positive;
+    let inactive_value = if high_active {
+        ctx.get_false()
+    } else {
+        ctx.get_true()
+    };
+    let active_value = if high_active {
+        ctx.get_true()
+    } else {
+        ctx.get_false()
+    };
+
+    // TODO: add 3-state sim support to patronus to speed up this operation
+    // TODO: add assumptions (like reset / !reset) to simplifier
+    let mut simplifier = Simplifier::new(SparseExprMap::default());
+    for state in sys.states.iter_mut() {
+        if let Some(old_next) = state.next {
+            let during_reset = patronus::expr::simple_transform_expr(ctx, old_next, |_, e, _| {
+                (e == reset_signal).then_some(active_value)
+            });
+            let during_reset = simplifier.simplify(ctx, during_reset);
+            if let Expr::BVLiteral(_) = ctx[during_reset] {
+                state.init = Some(during_reset);
+            }
+        }
+    }
+
+    // tie reset to inactive for whole system
+    sys.inputs.retain(|i| *i != reset_signal);
+    patronus::system::transform::do_transform(
+        ctx,
+        sys,
+        patronus::expr::ExprTransformMode::SingleStep,
+        |_, e, _| (e == reset_signal).then_some(inactive_value),
+    );
+    Ok(())
 }

@@ -8,7 +8,7 @@ publish.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 ron = "0.12"
 parser-verilator = { path = "../parser-verilator" }
-patronus = "0.38.1"
+patronus = "0.39.1"
 baa = { version = "0.19.3", features = ["bigint"] }
 
 [lints]
