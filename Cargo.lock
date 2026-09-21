@@ -210,10 +210,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "formal-utils"
-version = "0.1.0"
-
-[[package]]
 name = "fst-writer"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

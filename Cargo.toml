@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "parser-verilator",
-    "formal-utils",
     "formal",
     "simulator-rust",
     "simulator-rust/simulator-rust-runtime",
