@@ -13,20 +13,20 @@ for build_file in tests/*/build.ninja; do
     fixture_directory=$(dirname -- "$build_file")
     ast="$fixture_directory/build/ast.json"
 
-    aig_output="$fixture_directory/build/test.aig"
+    btor_output="$fixture_directory/build/test.btor"
     ron_output="$fixture_directory/build/test.ron"
 
     # Run verilator with ninja to generate the AST
     rm -rf "$fixture_directory/build"
     ninja -C "$fixture_directory"
 
-    # Generate the AIG and RON outputs using the built binary
+    # Generate the BTOR and RON outputs using the built binary
     if [ "$(basename -- "$fixture_directory")" = gecko_core ]; then
         echo "Running $binary $ast --clock clk --ron-output $ron_output"
         "$binary" "$ast" --clock clk --ron-output "$ron_output"
     else
-        echo "Running $binary $ast --clock clk --reset '!reset_n' --output $aig_output --ron-output $ron_output"
-        "$binary" "$ast" --clock clk --reset '!reset_n' --output "$aig_output" --ron-output "$ron_output"
+        echo "Running $binary $ast --clock clk --reset '!reset_n' --output $btor_output --ron-output $ron_output"
+        "$binary" "$ast" --clock clk --reset '!reset_n' --output "$btor_output" --ron-output "$ron_output"
     fi
 done
 
