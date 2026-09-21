@@ -1,5 +1,5 @@
 pub use crate::error::ConvertError;
-use parser_verilator::ast::{Edge, PropertyKind, SourceInfo};
+use parser_verilator::ast::{DataTypeId, DataTypeKind, Edge, PropertyKind, SourceInfo};
 use parser_verilator::{
     ast::{
         AssignmentKind, AssignmentTarget, BinaryOperator, Design, Direction, Domain, Expression,
@@ -8,7 +8,10 @@ use parser_verilator::{
     },
     document::AstDocument,
 };
-use patronus::expr::{Context, Expr, ExprRef, Simplifier, SparseExprMap, TypeCheck, WidthInt};
+use patronus::expr::{
+    ArrayType, Context, Expr, ExprRef, SerializableIrNode, Simplifier, SparseExprMap, Type,
+    TypeCheck, WidthInt,
+};
 use patronus::system::{Output, State, TransitionSystem};
 use std::cmp::Ordering;
 use std::{
@@ -223,20 +226,26 @@ impl Converter<'_> {
         let sequential = sequential::analyze(self.design).map_err(ConvertError::message)?;
         let mut register_ids = sequential.registers.clone();
 
+        for reg in &register_ids {
+            let var = self.design.variable(*reg);
+            let tpe = self.design.data_type(var.dtype);
+            println!("{} {:?} {:?}", var.display_name(), var.kind, tpe);
+        }
+
         // TODO: what does this mean?
         // Preserve the existing unpacked-array storage model for procedural
         // combinational element writes, which read the untouched elements.
-        register_ids.extend(
-            (&self.design.variables)
-                .into_iter()
-                .enumerate()
-                .filter(|(index, variable)| {
-                    self.design.data_type(variable.dtype).unpacked.is_some()
-                        && reads.contains(&VariableId(*index))
-                        && writes.contains(&VariableId(*index))
-                })
-                .map(|(index, _)| VariableId(index)),
-        );
+        // register_ids.extend(
+        //     (&self.design.variables)
+        //         .into_iter()
+        //         .enumerate()
+        //         .filter(|(index, variable)| {
+        //             self.design.data_type(variable.dtype).unpacked.is_some()
+        //                 && reads.contains(&VariableId(*index))
+        //                 && writes.contains(&VariableId(*index))
+        //         })
+        //         .map(|(index, _)| { todo!(); VariableId(index)}),
+        // );
 
         // find inputs
         let input_ids: Vec<_> = self
@@ -265,8 +274,9 @@ impl Converter<'_> {
             .into_iter()
             .map(|id| {
                 let variable = self.design.variable(id);
-                let width = self.design.data_type(variable.dtype).width as WidthInt;
-                let sym = ctx.bv_symbol(&variable.name, width);
+                let tpe = self.convert_data_type(variable.dtype);
+                let name = ctx.string((&variable.name).into());
+                let sym = ctx.symbol(name, tpe);
                 environment.insert(id, sym);
                 sym
             })
@@ -277,8 +287,9 @@ impl Converter<'_> {
             .iter()
             .map(|&id| {
                 let variable = self.design.variable(id);
-                let width = self.design.data_type(variable.dtype).width as WidthInt;
-                let symbol = ctx.bv_symbol(&variable.name, width);
+                let tpe = self.convert_data_type(variable.dtype);
+                let name = ctx.string((&variable.name).into());
+                let symbol = ctx.symbol(name, tpe);
                 environment.insert(id, symbol);
                 State {
                     symbol,
@@ -345,6 +356,37 @@ impl Converter<'_> {
         }
 
         Ok((self.sys, props))
+    }
+
+    fn convert_data_type(&self, dtype: DataTypeId) -> patronus::expr::Type {
+        // TODO: cache!
+        let dtype = self.design.data_type(dtype);
+        match dtype.kind {
+            DataTypeKind::Basic { packed } => Type::BV(packed.len() as WidthInt),
+            DataTypeKind::Alias { .. } => todo!("alias"),
+            DataTypeKind::Enum { .. } => todo!("enum"),
+            DataTypeKind::PackedArray { .. } => todo!("packed array"),
+            DataTypeKind::UnpackedArray { element, declared } => {
+                let index_width = declared.len() as WidthInt;
+                match self.convert_data_type(element) {
+                    Type::BV(data_width) => Type::Array(ArrayType {
+                        index_width,
+                        data_width,
+                    }),
+                    // for nested arrays, we just concatenate the addresses
+                    Type::Array(a) => {
+                        let index_width = index_width + a.index_width;
+                        let data_width = a.data_width;
+                        Type::Array(ArrayType {
+                            index_width,
+                            data_width,
+                        })
+                    }
+                }
+            }
+            DataTypeKind::PackedStruct { .. } => todo!("packed struct"),
+            DataTypeKind::PackedUnion { .. } => todo!("packed union"),
+        }
     }
 
     fn execute_combinational(
@@ -661,7 +703,13 @@ impl Converter<'_> {
             ExpressionKind::ArraySelect { array, index } => {
                 let value = self.on_bv_expr(ctx, array, environment)?;
                 let index = self.on_bv_expr(ctx, index, environment)?;
-                todo!("array select")
+                todo!(
+                    "array select {} : {:?} {} : {:?}",
+                    value.serialize_to_str(ctx),
+                    value.get_type(ctx),
+                    index.serialize_to_str(ctx),
+                    index.get_type(ctx)
+                )
             }
         }
     }
