@@ -1,5 +1,5 @@
 use clap::Parser;
-use formal::convert::NamedFsm;
+use formal::convert::{NamedFsm, Properties};
 use parser_verilator::{
     ast::{Design, Domain},
     document::AstDocument,
@@ -106,7 +106,6 @@ fn main() -> ExitCode {
         "clock: {:?} edge of {}",
         model.clock.domain.edge, model.clock.domain.name
     );
-    debug_assert_eq!(model.inputs.len(), model.sys.inputs.len());
     println!(
         "inputs: {} signals, {} bits",
         model.sys.inputs.len(),
@@ -117,7 +116,6 @@ fn main() -> ExitCode {
             .map(|&i| ctx[i].get_bv_type(&ctx).unwrap())
             .sum::<WidthInt>(),
     );
-    debug_assert_eq!(model.registers.len(), model.sys.states.len());
     println!(
         "registers: {} signals, {} bits",
         model.sys.states.len(),
@@ -128,7 +126,6 @@ fn main() -> ExitCode {
             .map(|&s| ctx[s.symbol].get_bv_type(&ctx).unwrap())
             .sum::<WidthInt>(),
     );
-    debug_assert_eq!(model.outputs.len(), model.sys.outputs.len());
     println!(
         "outputs: {} signals, {} bits",
         model.sys.outputs.len(),
@@ -139,17 +136,20 @@ fn main() -> ExitCode {
             .map(|&o| ctx[o.expr].get_bv_type(&ctx).unwrap())
             .sum::<WidthInt>(),
     );
-    // println!("gates: {}", model.fsm.get_gates().len());
-    debug_assert_eq!(model.assertions.len(), model.sys.bad_states.len());
-    debug_assert_eq!(model.assumptions.len(), model.sys.constraints.len());
     println!(
         "properties: {} assertions, {} assumptions, {} covers",
         model.sys.bad_states.len(),
-        model.assumptions.len(),
-        model.covers.len()
+        model.sys.constraints.len(),
+        model.properties.covers.len()
     );
 
-    if let Err(error) = select_property(&ctx, &mut model.sys, args.assert, args.cover) {
+    if let Err(error) = select_property(
+        &mut ctx,
+        &mut model.sys,
+        &mut model.properties,
+        args.assert,
+        args.cover,
+    ) {
         eprintln!("error: {error}");
         return ExitCode::FAILURE;
     }
@@ -189,30 +189,36 @@ fn main() -> ExitCode {
 }
 
 fn select_property(
-    ctx: &Context,
+    ctx: &mut Context,
     sys: &mut TransitionSystem,
+    props: &mut Properties,
     assertion_index: Option<usize>,
     cover_index: Option<usize>,
 ) -> Result<(), String> {
-    todo!()
-    // if let Some(index) = assertion_index {
-    //     let count = fsm.get_asserts().len();
-    //     let assertion =
-    //         fsm.get_asserts().get(index).cloned().ok_or_else(|| {
-    //             format!("assertion index {index} is out of range (found {count})")
-    //         })?;
-    //     fsm.get_asserts_mut().clear();
-    //     fsm.get_asserts_mut().push(assertion);
-    // } else if let Some(index) = cover_index {
-    //     let count = fsm.get_covers().len();
-    //     let (value, label) = fsm
-    //         .get_covers()
-    //         .get(index)
-    //         .cloned()
-    //         .ok_or_else(|| format!("cover index {index} is out of range (found {count})"))?;
-    //     fsm.get_asserts_mut().clear();
-    //     fsm.get_asserts_mut().push((!value, label));
-    // }
-    // fsm.get_covers_mut().clear();
-    // Ok(())
+    if let Some(index) = assertion_index {
+        let count = sys.bad_states.len();
+        let assertion =
+            sys.bad_states.get(index).cloned().ok_or_else(|| {
+                format!("assertion index {index} is out of range (found {count})")
+            })?;
+        sys.bad_states.clear();
+        sys.bad_states.push(assertion);
+        let name = props.asserts[index].clone();
+        props.asserts.clear();
+        props.asserts.push(name);
+    } else if let Some(index) = cover_index {
+        let count = props.cover_exprs.len();
+        let expr = props
+            .cover_exprs
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("cover index {index} is out of range (found {count})"))?;
+        sys.bad_states.clear();
+        sys.bad_states.push(ctx.not(expr));
+        props.asserts.clear();
+        props.asserts.push(props.covers[index].clone());
+    }
+    props.covers.clear();
+    props.cover_exprs.clear();
+    Ok(())
 }

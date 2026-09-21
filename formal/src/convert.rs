@@ -1,4 +1,7 @@
 pub use crate::error::ConvertError;
+use clap::builder::Str;
+use parser_verilator::ast::DataTypeKind::PackedArray;
+use parser_verilator::ast::{PropertyKind, SourceInfo};
 use parser_verilator::{
     ast::{
         AssignmentKind, AssignmentTarget, BinaryOperator, Design, Direction, Domain, Expression,
@@ -8,7 +11,7 @@ use parser_verilator::{
     document::AstDocument,
 };
 use patronus::expr::{Context, ExprRef, SerializableIrNode, TypeCheck, WidthInt};
-use patronus::system::{State, TransitionSystem};
+use patronus::system::{Output, State, TransitionSystem};
 use std::cmp::Ordering;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -32,12 +35,7 @@ pub struct NamedFsm {
     pub sys: TransitionSystem,
     pub clock: SignalDomain,
     pub reset: Option<SignalDomain>,
-    pub inputs: Vec<NamedSignal>,
-    pub registers: Vec<NamedSignal>,
-    pub outputs: Vec<NamedSignal>,
-    pub assertions: Vec<NamedProperty>,
-    pub assumptions: Vec<NamedProperty>,
-    pub covers: Vec<NamedProperty>,
+    pub properties: Properties,
 }
 
 impl NamedFsm {
@@ -53,7 +51,6 @@ impl NamedFsm {
 }
 
 type Environment = BTreeMap<VariableId, ExprRef>;
-type PropertyGroups = (Vec<NamedProperty>, Vec<NamedProperty>, Vec<NamedProperty>);
 
 struct Converter<'a> {
     design: &'a Design,
@@ -71,14 +68,20 @@ impl NamedFsm {
         reset: Option<Domain>,
     ) -> Result<Self, ConvertError> {
         let (clock, reset) = select_domains(design, Some(&clock), reset.as_ref())?;
-        Converter {
+        let (sys, properties) = Converter {
             design,
-            clock,
-            reset,
+            clock: clock.clone(),
+            reset: reset.clone(),
             sys: TransitionSystem::new("todo".into()),
             pending: Environment::new(),
         }
-        .convert(ctx)
+        .convert(ctx)?;
+        Ok(Self {
+            sys,
+            clock,
+            reset,
+            properties,
+        })
     }
 
     pub fn from_document(
@@ -214,6 +217,16 @@ fn label_variables_as(sys: &mut TransitionSystem, signal: &NamedSignal, name: &s
     todo!()
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct Properties {
+    pub asserts: Vec<String>,
+    pub assumes: Vec<String>,
+    pub covers: Vec<String>,
+    pub cover_exprs: Vec<ExprRef>,
+}
+
+type Covers = Vec<(String, ExprRef)>;
+
 impl Converter<'_> {
     fn analyse_rw(&self) -> (BTreeSet<VariableId>, BTreeSet<VariableId>) {
         let all_statements = (&self.design.combinational)
@@ -246,7 +259,10 @@ impl Converter<'_> {
         (reads, writes)
     }
 
-    fn convert(mut self, ctx: &mut Context) -> Result<NamedFsm, ConvertError> {
+    fn convert(
+        mut self,
+        ctx: &mut Context,
+    ) -> Result<(TransitionSystem, Properties), ConvertError> {
         // make sure that we can deal with all initial statements in the source
         if let Some(initial) = (&self.design.initial)
             .into_iter()
@@ -316,8 +332,8 @@ impl Converter<'_> {
 
         // add states to transition system (for now without next state or initial value)
         self.sys.states = register_ids
-            .into_iter()
-            .map(|id| {
+            .iter()
+            .map(|&id| {
                 let variable = self.design.variable(id);
                 let width = self.design.data_type(variable.dtype).width as WidthInt;
                 let symbol = ctx.bv_symbol(&variable.name, width);
@@ -330,98 +346,61 @@ impl Converter<'_> {
             })
             .collect();
 
-        self.execute_combinational(&self.design.combinational, &mut environment)?;
+        // TODO: it is unclear how this combinational logic analysis works
+        self.execute_combinational(ctx, &self.design.combinational, &mut environment)?;
 
-        todo!("{}", self.sys.serialize_to_str(ctx))
+        // Freeze sampled expressions before any clocked blocking assignments run.
+        let before_edge = environment.clone();
+        for (index, variable) in (&self.design.variables).into_iter().enumerate() {
+            if let Some(sampled) = &variable.sampled_value {
+                let value = self.on_bv_expr(ctx, sampled, &before_edge)?;
+                environment.insert(VariableId(index), value);
+            }
+        }
+        for id in &sequential.nonblocking {
+            self.pending.insert(*id, environment[id].clone());
+        }
 
-        //
-        // // Freeze sampled expressions before any clocked blocking assignments run.
-        // let before_edge = environment.clone();
-        // for (index, variable) in (&self.design.variables).into_iter().enumerate() {
-        //     if let Some(sampled) = &variable.sampled_value {
-        //         let value = self.expression(sampled, &before_edge)?;
-        //         environment.insert(VariableId(index), value);
-        //     }
-        // }
-        // for id in &sequential.nonblocking {
-        //     self.pending.insert(*id, environment[id].clone());
-        // }
-        // self.execute_all(&self.design.sequential, &mut environment)?;
-        // for (register, outputs) in &register_variables {
-        //     let next = self
-        //         .pending
-        //         .get(register)
-        //         .or_else(|| environment.get(register))
-        //         .cloned()
-        //         .ok_or_else(|| ConvertError::message("register has no next value"))?;
-        //     self.add_latches(*register, outputs, &next)?;
-        // }
-        //
-        // // Outputs describe the current FSM state; blocking procedural writes
-        // // above compute next-state values, just like deferred NBA writes.
-        // for id in &sequential.registers {
-        //     environment.insert(*id, register_variables[id].clone());
-        // }
-        // let mut outputs = Vec::new();
-        // for (index, variable) in (&self.design.variables).into_iter().enumerate() {
-        //     if variable.direction != Direction::Output {
-        //         continue;
-        //     }
-        //     let id = VariableId(index);
-        //     let values = environment.get(&id).ok_or_else(|| {
-        //         ConvertError::source(&variable.source, "output has no symbolic value")
-        //     })?;
-        //     let signal = named_signal(self.design, variable, values);
-        //     for (&value, name) in values.into_iter().zip(signal_bit_names(&signal)) {
-        //         let output = self.fsm.add_output(value);
-        //         *self.fsm.get_output_label_mut(output) = Some(sanitize_symbol(&name));
-        //     }
-        //     outputs.push(signal);
-        // }
-        //
-        // let (assertions, assumptions, covers) = self.add_properties(&environment)?;
-        // let mut model = NamedFsm {
-        //     fsm: self.fsm,
-        //     clock: self.clock,
-        //     reset: self.reset.clone(),
-        //     inputs,
-        //     registers,
-        //     outputs,
-        //     assertions,
-        //     assumptions,
-        //     covers,
-        // };
-        // reorder_model(&mut model);
-        // for (register, signal) in register_ids.into_iter().zip(&model.registers) {
-        //     label_variables_as(&mut model.fsm, signal, &self.design.variable(register).name);
-        // }
-        // if let Some(reset) = &self.reset {
-        //     apply_reset(&mut model, reset)?;
-        // }
-        // model.fsm.verify(VerifyOrdering::Verify);
-        // Ok(model)
+        for stmt in &self.design.sequential {
+            self.on_stmt(ctx, stmt, &mut environment)?;
+        }
+
+        for (register, state) in register_ids.iter().zip(self.sys.states.iter_mut()) {
+            let next = self
+                .pending
+                .get(register)
+                .or_else(|| environment.get(register))
+                .cloned()
+                .ok_or_else(|| ConvertError::message("register has no next value"))?;
+
+            state.next = Some(next);
+            if is_formal_history_register(self.design.variable(*register)) {
+                state.init = Some(ctx.zero(state.symbol.get_bv_type(ctx).unwrap()));
+            }
+        }
+
+        // reset register next state to current state for output calculation
+        for (register, state) in register_ids.iter().zip(self.sys.states.iter()) {
+            environment.insert(*register, state.symbol);
+        }
+
+        for (index, variable) in (&self.design.variables).into_iter().enumerate() {
+            if variable.direction != Direction::Output {
+                continue;
+            }
+            let id = VariableId(index);
+            let expr = environment.get(&id).cloned().ok_or_else(|| {
+                ConvertError::source(&variable.source, "output has no symbolic value")
+            })?;
+            let name = ctx.string(variable.display_name().into());
+            self.sys.outputs.push(Output { name, expr });
+        }
+
+        let props = self.add_properties(ctx, &environment)?;
+
+        Ok((self.sys, props))
     }
-    //
-    // fn add_latches(
-    //     &mut self,
-    //     register: VariableId,
-    //     outputs: &[ExprRef],
-    //     next: &[ExprRef],
-    // ) -> Result<(), ConvertError> {
-    //     if next.len() != outputs.len() {
-    //         return Err(ConvertError::message(format!(
-    //             "register {} next-state width mismatch",
-    //             self.design.variable(register).display_name()
-    //         )));
-    //     }
-    //     let history_value = formal_history_initial_value(self.design.variable(register));
-    //     for (&output, &input) in outputs.into_iter().zip(next) {
-    //         self.fsm
-    //             .add_latch(input, output.unwrap_variable(), history_value);
-    //     }
-    //     Ok(())
-    // }
-    //
+
     fn execute_combinational(
         &mut self,
         ctx: &mut Context,
@@ -471,12 +450,13 @@ impl Converter<'_> {
                 let value = self.on_bv_expr(ctx, value, environment)?;
                 if *kind == AssignmentKind::Nonblocking {
                     let mut pending = mem::take(&mut self.pending);
-                    let result = self.assign(target, value, &mut pending, environment);
+                    let result = self.assign(ctx, target, value, &mut pending, environment);
                     self.pending = pending;
                     result
                 } else {
+                    debug_assert_eq!(*kind, AssignmentKind::Blocking);
                     let evaluation = environment.clone();
-                    self.assign(target, value, environment, &evaluation)
+                    self.assign(ctx, target, value, environment, &evaluation)
                 }
             }
             StatementKind::If {
@@ -484,17 +464,28 @@ impl Converter<'_> {
                 then_statements,
                 else_statements,
             } => {
-                let condition_value = self.on_bv_expr(condition, environment)?;
-                let condition = self.truthy(&condition_value);
+                let condition_value = self.on_bv_expr(ctx, condition, environment)?;
+                let condition = self.truthy(ctx, condition_value);
                 let before = environment.clone();
                 let pending_before = self.pending.clone();
+
+                // true branch
                 let mut then_environment = before.clone();
-                self.execute_all(then_statements, &mut then_environment)?;
+                for stmt in then_statements {
+                    self.on_stmt(ctx, stmt, &mut then_environment)?;
+                }
                 let then_pending = mem::replace(&mut self.pending, pending_before);
+
+                // false branch
                 let mut else_environment = before.clone();
-                self.execute_all(else_statements, &mut else_environment)?;
+                for stmt in else_statements {
+                    self.on_stmt(ctx, stmt, &mut else_environment)?;
+                }
                 let else_pending = mem::take(&mut self.pending);
+
+                // reconcile environments after branch
                 self.pending = self.merge_environments(
+                    ctx,
                     &statement.source,
                     condition,
                     &then_pending,
@@ -502,6 +493,7 @@ impl Converter<'_> {
                     &Environment::new(),
                 )?;
                 *environment = self.merge_environments(
+                    ctx,
                     &statement.source,
                     condition,
                     &then_environment,
@@ -512,162 +504,148 @@ impl Converter<'_> {
             }
         }
     }
-    //
-    // fn merge_environments(
-    //     &mut self,
-    //     source: &SourceInfo,
-    //     condition: ExprRef,
-    //     then_environment: &Environment,
-    //     else_environment: &Environment,
-    //     before: &Environment,
-    // ) -> Result<Environment, ConvertError> {
-    //     let mut environment = Environment::new();
-    //     let keys = then_environment
-    //         .keys()
-    //         .chain(else_environment.keys())
-    //         .copied()
-    //         .collect::<BTreeSet<_>>();
-    //     for key in keys {
-    //         let width = self
-    //             .design
-    //             .variables
-    //             .get(key.0)
-    //             .map_or(0, |variable| self.design.data_type(variable.dtype).width);
-    //         let default = vec![ExprRef::Constant(false); width];
-    //         let then_value = then_environment
-    //             .get(&key)
-    //             .or_else(|| before.get(&key))
-    //             .unwrap_or(&default);
-    //         let else_value = else_environment
-    //             .get(&key)
-    //             .or_else(|| before.get(&key))
-    //             .unwrap_or(&default);
-    //         if then_value == else_value {
-    //             environment.insert(key, then_value.clone());
-    //         } else {
-    //             if then_value.len() != else_value.len() {
-    //                 return Err(ConvertError::source(source, "IF branch width mismatch"));
-    //             }
-    //             environment.insert(
-    //                 key,
-    //                 FsmOps::create_mux(&mut self.fsm, else_value, then_value, condition),
-    //             );
-    //         }
-    //     }
-    //     Ok(environment)
-    // }
-    //
-    // fn assign(
-    //     &mut self,
-    //     target: &AssignmentTarget,
-    //     value: Vec<ExprRef>,
-    //     environment: &mut Environment,
-    //     evaluation: &Environment,
-    // ) -> Result<(), ConvertError> {
-    //     match target {
-    //         AssignmentTarget::Variable { variable, .. } => {
-    //             let width = self
-    //                 .design
-    //                 .data_type(self.design.variable(*variable).dtype)
-    //                 .width;
-    //             environment.insert(
-    //                 *variable,
-    //                 resize(value, width, false, ExprRef::Constant(false)),
-    //             );
-    //             Ok(())
-    //         }
-    //         AssignmentTarget::Select {
-    //             target,
-    //             offset,
-    //             width,
-    //             ..
-    //         } => {
-    //             let target_value = self.read_target(target, environment, evaluation)?;
-    //             if value.len() != *width || *width > target_value.len() {
-    //                 return Err(ConvertError::source(
-    //                     &offset.source,
-    //                     "SEL assignment width mismatch",
-    //                 ));
-    //             }
-    //             if let ExpressionKind::Constant(literal) = &offset.kind {
-    //                 let offset = usize::try_from(&literal.value).unwrap();
-    //                 let mut result = target_value;
-    //                 result[offset..offset + width].copy_from_slice(&value);
-    //                 return self.assign(target, result, environment, evaluation);
-    //             }
-    //             let offset_value = self.expression(offset, evaluation)?;
-    //             let mut result = target_value.clone();
-    //             for candidate_offset in 0..=target_value.len() - width {
-    //                 let candidate_value = usize_values(candidate_offset, offset_value.len());
-    //                 let selected = self.equals_constant_without_or(&offset_value, &candidate_value);
-    //                 let mut candidate = target_value.clone();
-    //                 candidate[candidate_offset..candidate_offset + width].copy_from_slice(&value);
-    //                 result = self.mux_without_or(&result, &candidate, selected);
-    //             }
-    //             self.assign(target, result, environment, evaluation)
-    //         }
-    //         AssignmentTarget::ArrayElement {
-    //             array,
-    //             index,
-    //             dtype,
-    //         } => {
-    //             let layout = self.design.data_type(*dtype).unpacked.as_ref().unwrap();
-    //             if value.len() != layout.element_width {
-    //                 return Err(ConvertError::source(
-    //                     &index.source,
-    //                     "ARRAYSEL assignment width mismatch",
-    //                 ));
-    //             }
-    //             let index_value = self.expression(index, evaluation)?;
-    //             let current = self.read_target(array, environment, evaluation)?;
-    //             let mut result = current.clone();
-    //             for (offset, declared_index) in layout.indices.into_iter().enumerate() {
-    //                 let candidate =
-    //                     usize_values(usize::try_from(declared_index).unwrap(), index_value.len());
-    //                 let selected = self.equals_constant_without_or(&index_value, &candidate);
-    //                 let mut updated = current.clone();
-    //                 let start = offset * layout.element_width;
-    //                 updated[start..start + layout.element_width].copy_from_slice(&value);
-    //                 result = self.mux_without_or(&result, &updated, selected);
-    //             }
-    //             self.assign(array, result, environment, evaluation)
-    //         }
-    //     }
-    // }
-    //
-    // fn read_target(
-    //     &mut self,
-    //     target: &AssignmentTarget,
-    //     environment: &Environment,
-    //     evaluation: &Environment,
-    // ) -> Result<Vec<ExprRef>, ConvertError> {
-    //     match target {
-    //         AssignmentTarget::Variable { variable, .. } => {
-    //             environment.get(variable).cloned().ok_or_else(|| {
-    //                 ConvertError::message(format!(
-    //                     "assignment target {} is unresolved",
-    //                     self.design.variable(*variable).display_name()
-    //                 ))
-    //             })
-    //         }
-    //         AssignmentTarget::Select { offset, width, .. } => {
-    //             let AssignmentTarget::Select { target, .. } = target else {
-    //                 unreachable!()
-    //             };
-    //             let source = self.read_target(target, environment, evaluation)?;
-    //             self.select_value(source, offset, *width, evaluation)
-    //         }
-    //         AssignmentTarget::ArrayElement {
-    //             array,
-    //             index,
-    //             dtype,
-    //         } => {
-    //             let source = self.read_target(array, environment, evaluation)?;
-    //             self.array_select_value(source, index, self.design.data_type(*dtype), evaluation)
-    //         }
-    //     }
-    // }
-    //
+
+    /// Merges the divergent program state after and if/else statement
+    fn merge_environments(
+        &mut self,
+        ctx: &mut Context,
+        source: &SourceInfo,
+        condition: ExprRef,
+        then_environment: &Environment,
+        else_environment: &Environment,
+        before: &Environment,
+    ) -> Result<Environment, ConvertError> {
+        let mut environment = Environment::new();
+        let keys = then_environment
+            .keys()
+            .chain(else_environment.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for key in keys {
+            let width = self
+                .design
+                .variables
+                .get(key.0)
+                .map_or(0, |variable| self.design.data_type(variable.dtype).width)
+                as WidthInt;
+
+            // TODO: why is there a zero default?
+            let default = ctx.zero(width);
+            let then_value = then_environment
+                .get(&key)
+                .or_else(|| before.get(&key))
+                .cloned()
+                .unwrap_or(default);
+            let else_value = else_environment
+                .get(&key)
+                .or_else(|| before.get(&key))
+                .cloned()
+                .unwrap_or(default);
+            if then_value == else_value {
+                environment.insert(key, then_value.clone());
+            } else {
+                if ctx[then_value].get_bv_type(ctx) != ctx[else_value].get_bv_type(ctx) {
+                    return Err(ConvertError::source(source, "IF branch width mismatch"));
+                }
+                environment.insert(key, ctx.ite(condition, then_value, else_value));
+            }
+        }
+        Ok(environment)
+    }
+
+    fn assign(
+        &mut self,
+        ctx: &mut Context,
+        target: &AssignmentTarget,
+        value: ExprRef,
+        environment: &mut Environment,
+        evaluation: &Environment,
+    ) -> Result<(), ConvertError> {
+        match target {
+            &AssignmentTarget::Variable { variable, .. } => {
+                let width = self
+                    .design
+                    .data_type(self.design.variable(variable).dtype)
+                    .width as WidthInt;
+                environment.insert(variable, ext_or_truncate(ctx, value, width, false));
+                Ok(())
+            }
+            AssignmentTarget::Select {
+                target,
+                offset,
+                width,
+                ..
+            } => {
+                todo!("learn about selects and implement them")
+                // let target_value = self.read_target(target, environment, evaluation)?;
+                // if value.len() != *width || *width > target_value.len() {
+                //     return Err(ConvertError::source(
+                //         &offset.source,
+                //         "SEL assignment width mismatch",
+                //     ));
+                // }
+                // if let ExpressionKind::Constant(literal) = &offset.kind {
+                //     let offset = usize::try_from(&literal.value).unwrap();
+                //     let mut result = target_value;
+                //     result[offset..offset + width].copy_from_slice(&value);
+                //     return self.assign(target, result, environment, evaluation);
+                // }
+                // let offset_value = self.expression(offset, evaluation)?;
+                // let mut result = target_value.clone();
+                // for candidate_offset in 0..=target_value.len() - width {
+                //     let candidate_value = usize_values(candidate_offset, offset_value.len());
+                //     let selected = self.equals_constant_without_or(&offset_value, &candidate_value);
+                //     let mut candidate = target_value.clone();
+                //     candidate[candidate_offset..candidate_offset + width].copy_from_slice(&value);
+                //     result = self.mux_without_or(&result, &candidate, selected);
+                // }
+                // self.assign(target, result, environment, evaluation)
+            }
+            AssignmentTarget::ArrayElement {
+                array,
+                index,
+                dtype,
+            } => {
+                todo!("array assignments might need to be handled differently")
+            }
+        }
+    }
+
+    fn read_target(
+        &mut self,
+        target: &AssignmentTarget,
+        environment: &Environment,
+        evaluation: &Environment,
+    ) -> Result<ExprRef, ConvertError> {
+        match target {
+            &AssignmentTarget::Variable { variable, .. } => {
+                environment.get(&variable).cloned().ok_or_else(|| {
+                    ConvertError::message(format!(
+                        "assignment target {} is unresolved",
+                        self.design.variable(variable).display_name()
+                    ))
+                })
+            }
+            AssignmentTarget::Select { offset, width, .. } => {
+                let AssignmentTarget::Select { target, .. } = target else {
+                    unreachable!()
+                };
+                todo!("select")
+                // let source = self.read_target(target, environment, evaluation)?;
+                // self.select_value(source, offset, *width, evaluation)
+            }
+            AssignmentTarget::ArrayElement {
+                array,
+                index,
+                dtype,
+            } => {
+                todo!("array read")
+                // let source = self.read_target(array, environment, evaluation)?;
+                // self.array_select_value(source, index, self.design.data_type(*dtype), evaluation)
+            }
+        }
+    }
+
     fn on_bv_expr(
         &mut self,
         ctx: &mut Context,
@@ -731,16 +709,13 @@ impl Converter<'_> {
                 width,
             } => {
                 let value = self.on_bv_expr(ctx, value, environment)?;
-                self.select_value(value, offset, *width, environment)
+                todo!("select")
+                //self.select_value(ctx, value, offset, *width, environment)
             }
             ExpressionKind::ArraySelect { array, index } => {
-                let value = self.on_bv_expr(array, environment)?;
-                self.array_select_value(
-                    value,
-                    index,
-                    self.design.data_type(array.dtype),
-                    environment,
-                )
+                let value = self.on_bv_expr(ctx, array, environment)?;
+                let index = self.on_bv_expr(ctx, index, environment)?;
+                todo!("array select")
             }
         }
     }
@@ -887,7 +862,7 @@ impl Converter<'_> {
             BinaryOperator::Concat => ctx.concat(lhs_value, rhs_value),
         })
     }
-    //
+
     fn select_value(
         &mut self,
         ctx: &mut Context,
@@ -896,40 +871,43 @@ impl Converter<'_> {
         width: usize,
         environment: &Environment,
     ) -> Result<Vec<ExprRef>, ConvertError> {
-        if let ExpressionKind::Constant(literal) = &offset.kind {
-            let offset = usize::try_from(&literal.value).unwrap();
-            return Ok(value[offset..offset + width].to_vec());
-        }
-        let offset_value = self.expression(offset, environment)?;
-        let choice_count = value.len().checked_next_power_of_two().ok_or_else(|| {
-            ConvertError::source(&offset.source, "dynamic selection input is too wide")
-        })?;
-        let useful_offset_bits = choice_count.trailing_zeros() as usize;
-        let low_offset = resize(
-            offset_value.clone(),
-            useful_offset_bits,
-            false,
-            ExprRef::Constant(false),
-        );
-        let mut result = (0..width)
-            .map(|bit| {
-                let choices = (0..choice_count)
-                    .map(|candidate_offset| {
-                        value
-                            .get(candidate_offset + bit)
-                            .copied()
-                            .unwrap_or(ExprRef::Constant(false))
-                    })
-                    .collect::<Vec<_>>();
-                self.select_without_or(&choices, &low_offset)
-            })
-            .collect::<Vec<_>>();
-        if offset_value.len() > useful_offset_bits {
-            let oversized = self.truthy(&offset_value[useful_offset_bits..]);
-            let zero = vec![ExprRef::Constant(false); width];
-            result = FsmOps::create_mux(&mut self.fsm, &result, &zero, oversized);
-        }
-        Ok(result)
+        todo!("figure out how selects work and implement them")
+
+        //
+        // if let ExpressionKind::Constant(literal) = &offset.kind {
+        //     let offset = usize::try_from(&literal.value).unwrap();
+        //     return Ok(value[offset..offset + width].to_vec());
+        // }
+        // let offset_value = self.expression(offset, environment)?;
+        // let choice_count = value.len().checked_next_power_of_two().ok_or_else(|| {
+        //     ConvertError::source(&offset.source, "dynamic selection input is too wide")
+        // })?;
+        // let useful_offset_bits = choice_count.trailing_zeros() as usize;
+        // let low_offset = resize(
+        //     offset_value.clone(),
+        //     useful_offset_bits,
+        //     false,
+        //     ExprRef::Constant(false),
+        // );
+        // let mut result = (0..width)
+        //     .map(|bit| {
+        //         let choices = (0..choice_count)
+        //             .map(|candidate_offset| {
+        //                 value
+        //                     .get(candidate_offset + bit)
+        //                     .copied()
+        //                     .unwrap_or(ExprRef::Constant(false))
+        //             })
+        //             .collect::<Vec<_>>();
+        //         self.select_without_or(&choices, &low_offset)
+        //     })
+        //     .collect::<Vec<_>>();
+        // if offset_value.len() > useful_offset_bits {
+        //     let oversized = self.truthy(&offset_value[useful_offset_bits..]);
+        //     let zero = vec![ExprRef::Constant(false); width];
+        //     result = FsmOps::create_mux(&mut self.fsm, &result, &zero, oversized);
+        // }
+        // Ok(result)
     }
     //
     // fn array_select_value(
@@ -1016,54 +994,48 @@ impl Converter<'_> {
     //     level[0]
     // }
     //
-    // fn add_properties(
-    //     &mut self,
-    //     environment: &Environment,
-    // ) -> Result<PropertyGroups, ConvertError> {
-    //     let mut assertions = Vec::new();
-    //     let mut assumptions = Vec::new();
-    //     let mut covers = Vec::new();
-    //     for (index, variable) in (&self.design.variables).into_iter().enumerate() {
-    //         let Some(property) = &variable.property else {
-    //             continue;
-    //         };
-    //         let values = environment.get(&VariableId(index)).ok_or_else(|| {
-    //             ConvertError::source(&variable.source, "formal wire has no symbolic value")
-    //         })?;
-    //         if values.len() != 1 {
-    //             return Err(ConvertError::source(
-    //                 &variable.source,
-    //                 "formal wire is not one bit",
-    //             ));
-    //         }
-    //         let named = NamedProperty {
-    //             name: property.name.clone(),
-    //             value: if property.kind == PropertyKind::Assertion {
-    //                 !values[0]
-    //             } else {
-    //                 values[0]
-    //             },
-    //         };
-    //         match property.kind {
-    //             PropertyKind::Assertion => {
-    //                 let index = self.fsm.add_assert(named.value);
-    //                 *self.fsm.get_assert_label_mut(index) = Some(sanitize_symbol(&named.name));
-    //                 assertions.push(named);
-    //             }
-    //             PropertyKind::Assumption => {
-    //                 let index = self.fsm.add_assume(named.value);
-    //                 *self.fsm.get_assume_label_mut(index) = Some(sanitize_symbol(&named.name));
-    //                 assumptions.push(named);
-    //             }
-    //             PropertyKind::Cover => {
-    //                 let index = self.fsm.add_cover(named.value);
-    //                 *self.fsm.get_cover_label_mut(index) = Some(sanitize_symbol(&named.name));
-    //                 covers.push(named);
-    //             }
-    //         }
-    //     }
-    //     Ok((assertions, assumptions, covers))
-    // }
+    fn add_properties(
+        &mut self,
+        ctx: &mut Context,
+        environment: &Environment,
+    ) -> Result<Properties, ConvertError> {
+        let mut p = Properties::default();
+        for (index, variable) in (&self.design.variables).into_iter().enumerate() {
+            let Some(property) = &variable.property else {
+                continue;
+            };
+            let value = environment
+                .get(&VariableId(index))
+                .cloned()
+                .ok_or_else(|| {
+                    ConvertError::source(&variable.source, "formal wire has no symbolic value")
+                })?;
+            if value.get_bv_type(ctx) != Some(1) {
+                return Err(ConvertError::source(
+                    &variable.source,
+                    "formal wire is not one bit",
+                ));
+            }
+            let name = property.name.clone();
+
+            // TODO: add a way to name properties to the TransitionSystem API
+            match property.kind {
+                PropertyKind::Assertion => {
+                    self.sys.bad_states.push(ctx.not(value));
+                    p.asserts.push(name);
+                }
+                PropertyKind::Assumption => {
+                    self.sys.constraints.push(value);
+                    p.assumes.push(name);
+                }
+                PropertyKind::Cover => {
+                    p.cover_exprs.push(value);
+                    p.covers.push(name);
+                }
+            }
+        }
+        Ok(p)
+    }
 }
 
 // These generated zero assignments are represented by the formal latch reset values.
@@ -1087,18 +1059,18 @@ fn is_formal_static_initializer(design: &Design, statement: &Statement) -> bool 
         let ExpressionKind::Constant(literal) = &value.kind else {
             return false;
         };
-        formal_history_initial_value(design.variable(*variable)) == Some(false)
-            && literal.value.bits() == 0
+        is_formal_history_register(design.variable(*variable)) && literal.value.bits() == 0
     })
 }
 
-fn formal_history_initial_value(variable: &Variable) -> Option<bool> {
+/// formal history registers need to be initialized to zero
+fn is_formal_history_register(variable: &Variable) -> bool {
     let formal_history = variable
         .original_name
         .as_deref()
         .and_then(|name| name.rsplit('.').next())
         .is_some_and(|name| name.starts_with("_Vpast_") || name.starts_with("__Vnfa_"));
-    (variable.kind == VariableKind::ModuleTemporary && formal_history).then_some(false)
+    variable.kind == VariableKind::ModuleTemporary && formal_history
 }
 
 fn named_signal(
@@ -1133,15 +1105,15 @@ fn ext_or_truncate(ctx: &mut Context, e: ExprRef, out_width: WidthInt, signed: b
 }
 
 fn apply_reset(model: &mut NamedFsm, reset: &SignalDomain) -> Result<(), ConvertError> {
-    let reset_signal = (&model.inputs)
-        .into_iter()
-        .find(|signal| signal.name == reset.domain.name)
-        .ok_or_else(|| {
-            ConvertError::message(format!(
-                "reset input {} was not converted",
-                reset.domain.name
-            ))
-        })?;
+    // let reset_signal = (&model.inputs)
+    //     .into_iter()
+    //     .find(|signal| signal.name == reset.domain.name)
+    //     .ok_or_else(|| {
+    //         ConvertError::message(format!(
+    //             "reset input {} was not converted",
+    //             reset.domain.name
+    //         ))
+    //     })?;
     todo!()
     // if reset_signal.bits.len() != 1 {
     //     return Err(ConvertError::message(format!(
