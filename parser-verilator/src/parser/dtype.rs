@@ -127,6 +127,12 @@ impl<'a> DataTypeResolver<'a> {
                 Some("shortint") => 16,
                 Some("int" | "integer") => 32,
                 Some("longint" | "time") => 64,
+                //
+                Some("string") => {
+                    return Err(
+                        self.resolution_error(origin, "TODO: deal with variable length strings")
+                    );
+                }
                 Some(keyword) => {
                     return Err(self.resolution_error(
                         origin,

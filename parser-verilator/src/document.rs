@@ -120,7 +120,11 @@ impl From<serde_json::Error> for LoadError {
 
 impl AstDocument {
     pub fn from_reader(reader: impl Read) -> Result<Self, serde_json::Error> {
-        serde_json::from_reader(reader)
+        let mut de = serde_json::Deserializer::from_reader(reader);
+        de.disable_recursion_limit();
+        let value: Self = serde::Deserialize::deserialize(&mut de)?;
+        de.end()?;
+        Ok(value)
     }
 
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LoadError> {
